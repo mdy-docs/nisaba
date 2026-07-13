@@ -37,6 +37,27 @@
  * $pull operators (top-level fields only) instead of replacing the whole
  * document — see update.h for the exact rules and deliberate omissions.
  *
+ * Besides the composite-key equality index from milestone 2, a collection
+ * may attach a *text* index (single field, backed by a TextIndex's three
+ * trees — textindex.h) or a *geo* index (single field, backed by an rtree
+ * — rtree.h, GeoJSON Point values only: {type:"Point", coordinates:
+ * [lng, lat]}). A collection may have at most one text index (matching
+ * MongoDB's own restriction). dc_find/dc_find_one/dc_count/dc_update_many
+ * dispatch to whichever index a filter's `$text`/`$near`/`$geoWithin`
+ * clause names *before* trying the equality planner — see
+ * resolve_special_source in db.c for the exact recognized shapes
+ * ({$text: {$search: "..."}}, {field: {$near: {$geometry: {...},
+ * $maxDistance: km}}}, {field: {$geoWithin: {$box: [[minLng,minLat],
+ * [maxLng,maxLat]]}}} or {$geoWithin: {$center: [[lng,lat], radiusKm]}}).
+ * $near/$geoWithin distances are in **kilometers**, not meters — a
+ * deliberate deviation from real MongoDB (which uses meters/radians
+ * depending on the operator) chosen for consistency with rtree.h's own
+ * km-based API; $near and $geoWithin both require an attached geo index on
+ * the named field (BJ_ERR_STATE otherwise) — real MongoDB only requires
+ * one for $near, but requiring it for $geoWithin too avoids duplicating
+ * point-in-shape math in query.c for what is, in practice, an uncommon
+ * unindexed-geo-scan use case.
+ *
  * Known gap (see docs/db-plan.md milestone 5): index maintenance is not
  * transactional with the primary write. If a crash or an index-maintenance
  * error (e.g. a document missing an indexed field) happens between updating
@@ -54,6 +75,8 @@
 
 #include "binjson.h"
 #include "bplustree.h"
+#include "rtree.h"
+#include "textindex.h"
 #include "query.h"
 #include "update.h"
 
@@ -105,8 +128,50 @@ int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
                             bpt *index_tree,
                             const uint8_t *fields, uint32_t fields_len);
 
+/*
+ * Like dc_collection_attach_index, but for a single-field *text* index
+ * backed by an already-open TextIndex's three trees (textindex.h) —
+ * expected to already hold exactly the postings for every document
+ * currently in `c`. BJ_ERR_STATE if `name` is already registered or `c`
+ * already has a text index (MongoDB allows at most one per collection).
+ */
+int dc_collection_attach_text_index(dc_collection *c, const char *name, int name_len,
+                                    bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
+                                    const char *field, int field_len);
+
+/*
+ * Like dc_collection_add_index, but for a text index: attaches it (as
+ * dc_collection_attach_text_index) and backfills it against every existing
+ * document. Documents whose `field` is missing or not a string are
+ * silently skipped (not indexed) rather than failing the whole call —
+ * MongoDB's own text-index behavior, unlike the equality index's
+ * all-or-nothing validation.
+ */
+int dc_collection_add_text_index(dc_collection *c, const char *name, int name_len,
+                                 bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
+                                 const char *field, int field_len);
+
+/*
+ * Like dc_collection_attach_index, but for a single-field *geo* index
+ * backed by an already-open rtree (rtree.h) — expected to already hold
+ * exactly the points for every document currently in `c`.
+ */
+int dc_collection_attach_geo_index(dc_collection *c, const char *name, int name_len,
+                                   rtree *rt, const char *field, int field_len);
+
+/*
+ * Like dc_collection_add_index, but for a geo index: attaches it (as
+ * dc_collection_attach_geo_index) and backfills it against every existing
+ * document. Documents whose `field` is missing are silently skipped (not
+ * indexed); a present-but-malformed GeoJSON Point value fails the whole
+ * call (BJ_ERR_STATE), matching a real 2dsphere index's validation.
+ */
+int dc_collection_add_geo_index(dc_collection *c, const char *name, int name_len,
+                                rtree *rt, const char *field, int field_len);
+
 /* Unregister a previously attached/added index by name. Does not touch its
- * tree (the host closes/deletes its file). BJ_ERR_STATE if no such index. */
+ * tree(s) (the host closes/deletes its file(s)). BJ_ERR_STATE if no such
+ * index. */
 int dc_collection_remove_index(dc_collection *c, const char *name, int name_len);
 
 /*

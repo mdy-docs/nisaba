@@ -55,6 +55,30 @@ EMSCRIPTEN_KEEPALIVE int dcw_collection_add_index(dc_collection *c,
         const uint8_t *fields, int fields_len) {
     return dc_collection_add_index(c, name, name_len, index_tree, fields, (uint32_t)fields_len);
 }
+EMSCRIPTEN_KEEPALIVE int dcw_collection_attach_text_index(dc_collection *c,
+        const char *name, int name_len,
+        bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
+        const char *field, int field_len) {
+    return dc_collection_attach_text_index(c, name, name_len, tix_index, tix_doc_terms, tix_doc_lengths, field, field_len);
+}
+EMSCRIPTEN_KEEPALIVE int dcw_collection_add_text_index(dc_collection *c,
+        const char *name, int name_len,
+        bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
+        const char *field, int field_len) {
+    return dc_collection_add_text_index(c, name, name_len, tix_index, tix_doc_terms, tix_doc_lengths, field, field_len);
+}
+
+EMSCRIPTEN_KEEPALIVE int dcw_collection_attach_geo_index(dc_collection *c,
+        const char *name, int name_len, rtree *rt,
+        const char *field, int field_len) {
+    return dc_collection_attach_geo_index(c, name, name_len, rt, field, field_len);
+}
+EMSCRIPTEN_KEEPALIVE int dcw_collection_add_geo_index(dc_collection *c,
+        const char *name, int name_len, rtree *rt,
+        const char *field, int field_len) {
+    return dc_collection_add_geo_index(c, name, name_len, rt, field, field_len);
+}
+
 EMSCRIPTEN_KEEPALIVE int dcw_collection_remove_index(dc_collection *c,
         const char *name, int name_len) {
     return dc_collection_remove_index(c, name, name_len);

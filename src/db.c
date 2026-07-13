@@ -20,13 +20,28 @@
 
 /* ---- dc_collection: primary tree + attached secondary indexes --------- */
 
+typedef enum { DC_IDX_EQUALITY, DC_IDX_TEXT, DC_IDX_GEO } dc_index_kind;
+
 typedef struct {
     char *name;
     uint32_t name_len;
+    dc_index_kind kind;
+
+    /* DC_IDX_EQUALITY */
     bpt *tree;                  /* not owned */
     uint8_t **field_names;      /* owned copies, one per composite-key part */
     uint32_t *field_name_lens;
     uint32_t field_count;
+
+    /* DC_IDX_TEXT */
+    bpt *tix_index, *tix_doc_terms, *tix_doc_lengths; /* not owned */
+    char *text_field;           /* owned */
+    uint32_t text_field_len;
+
+    /* DC_IDX_GEO */
+    rtree *rt;                  /* not owned */
+    char *geo_field;            /* owned */
+    uint32_t geo_field_len;
 } dc_index;
 
 struct dc_collection {
@@ -41,6 +56,8 @@ static void free_index(dc_index *ix) {
     for (uint32_t i = 0; i < ix->field_count; i++) free(ix->field_names[i]);
     free(ix->field_names);
     free(ix->field_name_lens);
+    free(ix->text_field);
+    free(ix->geo_field);
     memset(ix, 0, sizeof(*ix));
 }
 
@@ -68,6 +85,48 @@ static dc_index *find_index(dc_collection *c, const char *name, int name_len) {
     return NULL;
 }
 
+/* Append `ix` (already fully populated) to `c->indexes`, growing the array
+ * as needed. Consumes `ix` on success; on OOM, frees it and returns
+ * BJ_ERR_OOM (the caller need not also free it). */
+static int append_index(dc_collection *c, dc_index *ix) {
+    if (c->index_count == c->index_cap) {
+        uint32_t ncap = c->index_cap ? c->index_cap * 2 : 4;
+        dc_index *nb = (dc_index *)realloc(c->indexes, ncap * sizeof(dc_index));
+        if (!nb) { free_index(ix); return BJ_ERR_OOM; }
+        c->indexes = nb;
+        c->index_cap = ncap;
+    }
+    c->indexes[c->index_count++] = *ix;
+    return BJ_OK;
+}
+
+/* Defined in the index-maintenance section below; forward-declared here so
+ * backfill_index (used by the dc_collection_add_*_index family, defined
+ * earlier in the file for readability alongside their attach_* siblings)
+ * can call it. */
+static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]);
+
+/* Scan every document in `c->primary` and add it to `ix` (already
+ * appended to `c`, expected empty). On failure, unregisters `ix` from `c`
+ * so the caller's own cleanup only needs to discard the index's file(s). */
+static int backfill_index(dc_collection *c, const char *name, int name_len) {
+    dc_index *ix = find_index(c, name, name_len);
+    bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
+    if (!cur_h) { dc_collection_remove_index(c, name, name_len); return BJ_ERR_OOM; }
+    int rc = BJ_OK;
+    for (;;) {
+        bpt_key k; const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+        if (r < 0) { rc = r; break; }
+        if (r == 0) break;
+        rc = add_to_one_index(ix, val, vlen, k.str);
+        if (rc) break;
+    }
+    bpt_cursor_close(cur_h);
+    if (rc) dc_collection_remove_index(c, name, name_len);
+    return rc;
+}
+
 int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
                                bpt *index_tree,
                                const uint8_t *fields, uint32_t fields_len) {
@@ -81,6 +140,7 @@ int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
 
     dc_index ix;
     memset(&ix, 0, sizeof(ix));
+    ix.kind = DC_IDX_EQUALITY;
     ix.name = (char *)malloc(name_len ? (size_t)name_len : 1);
     if (!ix.name) return BJ_ERR_OOM;
     memcpy(ix.name, name, (size_t)name_len);
@@ -101,15 +161,68 @@ int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
         ix.field_count = i + 1;
     }
 
-    if (c->index_count == c->index_cap) {
-        uint32_t ncap = c->index_cap ? c->index_cap * 2 : 4;
-        dc_index *nb = (dc_index *)realloc(c->indexes, ncap * sizeof(dc_index));
-        if (!nb) { free_index(&ix); return BJ_ERR_OOM; }
-        c->indexes = nb;
-        c->index_cap = ncap;
+    return append_index(c, &ix);
+}
+
+int dc_collection_attach_text_index(dc_collection *c, const char *name, int name_len,
+                                    bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
+                                    const char *field, int field_len) {
+    if (find_index(c, name, name_len)) return BJ_ERR_STATE;
+    if (field_len <= 0) return BJ_ERR_STATE;
+    for (uint32_t i = 0; i < c->index_count; i++) {
+        if (c->indexes[i].kind == DC_IDX_TEXT) return BJ_ERR_STATE; /* one text index per collection */
     }
-    c->indexes[c->index_count++] = ix;
-    return BJ_OK;
+
+    dc_index ix;
+    memset(&ix, 0, sizeof(ix));
+    ix.kind = DC_IDX_TEXT;
+    ix.name = (char *)malloc(name_len ? (size_t)name_len : 1);
+    if (!ix.name) return BJ_ERR_OOM;
+    memcpy(ix.name, name, (size_t)name_len);
+    ix.name_len = (uint32_t)name_len;
+    ix.tix_index = tix_index; ix.tix_doc_terms = tix_doc_terms; ix.tix_doc_lengths = tix_doc_lengths;
+    ix.text_field = (char *)malloc((size_t)field_len);
+    if (!ix.text_field) { free_index(&ix); return BJ_ERR_OOM; }
+    memcpy(ix.text_field, field, (size_t)field_len);
+    ix.text_field_len = (uint32_t)field_len;
+
+    return append_index(c, &ix);
+}
+
+int dc_collection_add_text_index(dc_collection *c, const char *name, int name_len,
+                                 bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
+                                 const char *field, int field_len) {
+    int e = dc_collection_attach_text_index(c, name, name_len, tix_index, tix_doc_terms, tix_doc_lengths, field, field_len);
+    if (e) return e;
+    return backfill_index(c, name, name_len);
+}
+
+int dc_collection_attach_geo_index(dc_collection *c, const char *name, int name_len,
+                                   rtree *rt, const char *field, int field_len) {
+    if (find_index(c, name, name_len)) return BJ_ERR_STATE;
+    if (field_len <= 0) return BJ_ERR_STATE;
+
+    dc_index ix;
+    memset(&ix, 0, sizeof(ix));
+    ix.kind = DC_IDX_GEO;
+    ix.name = (char *)malloc(name_len ? (size_t)name_len : 1);
+    if (!ix.name) return BJ_ERR_OOM;
+    memcpy(ix.name, name, (size_t)name_len);
+    ix.name_len = (uint32_t)name_len;
+    ix.rt = rt;
+    ix.geo_field = (char *)malloc((size_t)field_len);
+    if (!ix.geo_field) { free_index(&ix); return BJ_ERR_OOM; }
+    memcpy(ix.geo_field, field, (size_t)field_len);
+    ix.geo_field_len = (uint32_t)field_len;
+
+    return append_index(c, &ix);
+}
+
+int dc_collection_add_geo_index(dc_collection *c, const char *name, int name_len,
+                                rtree *rt, const char *field, int field_len) {
+    int e = dc_collection_attach_geo_index(c, name, name_len, rt, field, field_len);
+    if (e) return e;
+    return backfill_index(c, name, name_len);
 }
 
 int dc_collection_remove_index(dc_collection *c, const char *name, int name_len) {
@@ -170,11 +283,84 @@ static int filter_is_id_only(const uint8_t *filter, size_t filter_len,
     return BJ_OK;
 }
 
+/* ---- geo/text helpers ------------------------------------------------------ */
+
+static void oid_to_hex(const uint8_t id[12], char hex[24]) {
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < 12; i++) {
+        hex[i * 2] = digits[id[i] >> 4];
+        hex[i * 2 + 1] = digits[id[i] & 0xf];
+    }
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_to_oid(const char *hex, int hex_len, uint8_t id[12]) {
+    if (hex_len != 24) return BJ_ERR_STATE;
+    for (int i = 0; i < 12; i++) {
+        int hi = hex_nibble(hex[i * 2]), lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return BJ_ERR_STATE;
+        id[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return BJ_OK;
+}
+
+/* Parse a binjson ARRAY of exactly 2 numbers, e.g. a GeoJSON coordinate
+ * pair or a legacy [x, y] point. */
+static int read_number_pair(const uint8_t *val, size_t val_len, double *a, double *b) {
+    if (val_len < 1 || val[0] != BJ_TYPE_ARRAY) return BJ_ERR_STATE;
+    cur c = { val, val_len, 0 };
+    uint32_t count;
+    int e = array_begin(&c, &count);
+    if (e) return e;
+    if (count != 2) return BJ_ERR_STATE;
+    size_t p0 = c.pos;
+    e = skip_value(&c);
+    if (e) return e;
+    cur c0 = { c.d + p0, c.pos - p0, 0 };
+    e = read_number(&c0, a);
+    if (e) return e;
+    size_t p1 = c.pos;
+    e = skip_value(&c);
+    if (e) return e;
+    cur c1 = { c.d + p1, c.pos - p1, 0 };
+    return read_number(&c1, b);
+}
+
+/* {type: "Point", coordinates: [lng, lat]} -- GeoJSON, longitude first. */
+static int parse_geojson_point(const uint8_t *val, size_t val_len, double *lat, double *lng) {
+    if (val_len < 1 || val[0] != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
+    const uint8_t *tp; size_t tlen; int tfound;
+    int e = obj_get_field(val, val_len, (const uint8_t *)"type", 4, &tp, &tlen, &tfound);
+    if (e) return e;
+    if (!tfound || tlen < 1 || tp[0] != BJ_TYPE_STRING) return BJ_ERR_STATE;
+    cur tc = { tp, tlen, 0 };
+    const uint8_t *ts; uint32_t tslen;
+    e = take_string(&tc, &ts, &tslen);
+    if (e) return e;
+    if (!(tslen == 5 && memcmp(ts, "Point", 5) == 0)) return BJ_ERR_STATE;
+
+    const uint8_t *cp; size_t clen; int cfound;
+    e = obj_get_field(val, val_len, (const uint8_t *)"coordinates", 11, &cp, &clen, &cfound);
+    if (e) return e;
+    if (!cfound) return BJ_ERR_STATE;
+    double x, y;
+    e = read_number_pair(cp, clen, &x, &y);
+    if (e) return e;
+    *lng = x; *lat = y;
+    return BJ_OK;
+}
+
 /* ---- index maintenance --------------------------------------------------- */
 
-/* Build one index's composite key for `doc`/`id` (its ordered field values
- * followed by the id-suffix tag + `id`) into `out`, an ordinary dbuf the
- * caller zero-inits and frees. */
+/* Build one composite-key equality index's key for `doc`/`id` (its ordered
+ * field values followed by the id-suffix tag + `id`) into `out`, an
+ * ordinary dbuf the caller zero-inits and frees. */
 static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_len,
                            const uint8_t id[12], dbuf *out) {
     for (uint32_t i = 0; i < ix->field_count; i++) {
@@ -189,29 +375,86 @@ static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_le
 }
 
 static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
-    dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
-    int e = build_index_key(ix, doc, doc_len, id, &key_bytes);
-    if (e) { dbuf_free(&key_bytes); return e; }
-    bpt_key key; key.is_string = 1; key.num = 0;
-    key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
-    /* The index's value is a proper binjson-encoded OID (the row reference,
-     * per bplustree.h's composite-key convention) so index files stay
-     * independently inspectable with bin/bplustree.js. */
-    uint8_t idval[13]; idval[0] = BJ_TYPE_OID; memcpy(idval + 1, id, 12);
-    e = bpt_add(ix->tree, &key, idval, 13);
-    dbuf_free(&key_bytes);
-    return e;
+    if (ix->kind == DC_IDX_EQUALITY) {
+        dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
+        int e = build_index_key(ix, doc, doc_len, id, &key_bytes);
+        if (e) { dbuf_free(&key_bytes); return e; }
+        bpt_key key; key.is_string = 1; key.num = 0;
+        key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
+        /* The index's value is a proper binjson-encoded OID (the row
+         * reference, per bplustree.h's composite-key convention) so index
+         * files stay independently inspectable with bin/bplustree.js. */
+        uint8_t idval[13]; idval[0] = BJ_TYPE_OID; memcpy(idval + 1, id, 12);
+        e = bpt_add(ix->tree, &key, idval, 13);
+        dbuf_free(&key_bytes);
+        return e;
+    }
+
+    if (ix->kind == DC_IDX_TEXT) {
+        const uint8_t *vp; size_t vlen; int found;
+        int e = obj_get_field(doc, doc_len, (const uint8_t *)ix->text_field, ix->text_field_len, &vp, &vlen, &found);
+        if (e) return e;
+        /* Missing or non-string: not text-indexable, silently skipped --
+         * matches a real MongoDB text index's own tolerance. */
+        if (!found || vlen < 1 || vp[0] != BJ_TYPE_STRING) return BJ_OK;
+        cur c = { vp, vlen, 0 };
+        const uint8_t *text; uint32_t text_len;
+        e = take_string(&c, &text, &text_len);
+        if (e) return e;
+        char hex[24];
+        oid_to_hex(id, hex);
+        return tix_add(ix->tix_index, ix->tix_doc_terms, ix->tix_doc_lengths, NULL,
+                       hex, 24, (const char *)text, (int)text_len);
+    }
+
+    /* DC_IDX_GEO */
+    {
+        const uint8_t *vp; size_t vlen; int found;
+        int e = obj_get_field(doc, doc_len, (const uint8_t *)ix->geo_field, ix->geo_field_len, &vp, &vlen, &found);
+        if (e) return e;
+        if (!found) return BJ_OK; /* missing field: not geo-indexable, silently skipped */
+        double lat, lng;
+        e = parse_geojson_point(vp, vlen, &lat, &lng);
+        if (e) return e; /* present but malformed: an error, like a real 2dsphere index */
+        return rtree_insert(ix->rt, lat, lng, id);
+    }
 }
 
 static int remove_from_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
-    dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
-    int e = build_index_key(ix, doc, doc_len, id, &key_bytes);
-    if (e) { dbuf_free(&key_bytes); return e; }
-    bpt_key key; key.is_string = 1; key.num = 0;
-    key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
-    e = bpt_delete(ix->tree, &key);
-    dbuf_free(&key_bytes);
-    return e;
+    if (ix->kind == DC_IDX_EQUALITY) {
+        dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
+        int e = build_index_key(ix, doc, doc_len, id, &key_bytes);
+        if (e) { dbuf_free(&key_bytes); return e; }
+        bpt_key key; key.is_string = 1; key.num = 0;
+        key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
+        e = bpt_delete(ix->tree, &key);
+        dbuf_free(&key_bytes);
+        return e;
+    }
+
+    if (ix->kind == DC_IDX_TEXT) {
+        const uint8_t *vp; size_t vlen; int found;
+        int e = obj_get_field(doc, doc_len, (const uint8_t *)ix->text_field, ix->text_field_len, &vp, &vlen, &found);
+        if (e) return e;
+        if (!found || vlen < 1 || vp[0] != BJ_TYPE_STRING) return BJ_OK; /* was never indexed */
+        char hex[24];
+        oid_to_hex(id, hex);
+        int removed = 0;
+        return tix_remove(ix->tix_index, ix->tix_doc_terms, ix->tix_doc_lengths, NULL, hex, 24, &removed);
+    }
+
+    /* DC_IDX_GEO */
+    {
+        const uint8_t *vp; size_t vlen; int found;
+        int e = obj_get_field(doc, doc_len, (const uint8_t *)ix->geo_field, ix->geo_field_len, &vp, &vlen, &found);
+        if (e) return e;
+        if (!found) return BJ_OK;
+        double lat, lng;
+        e = parse_geojson_point(vp, vlen, &lat, &lng);
+        if (e) return e;
+        int removed = 0;
+        return rtree_remove_at(ix->rt, lat, lng, id, &removed);
+    }
 }
 
 static int add_to_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
@@ -235,22 +478,7 @@ int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
                             const uint8_t *fields, uint32_t fields_len) {
     int e = dc_collection_attach_index(c, name, name_len, index_tree, fields, fields_len);
     if (e) return e;
-    dc_index *ix = &c->indexes[c->index_count - 1];
-
-    bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
-    if (!cur_h) { dc_collection_remove_index(c, name, name_len); return BJ_ERR_OOM; }
-    int rc = BJ_OK;
-    for (;;) {
-        bpt_key k; const uint8_t *val; size_t vlen;
-        int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
-        if (r < 0) { rc = r; break; }
-        if (r == 0) break;
-        rc = add_to_one_index(ix, val, vlen, k.str);
-        if (rc) break;
-    }
-    bpt_cursor_close(cur_h);
-    if (rc) { dc_collection_remove_index(c, name, name_len); return rc; }
-    return BJ_OK;
+    return backfill_index(c, name, name_len);
 }
 
 int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len,
@@ -375,6 +603,7 @@ static int plan_equality_index(dc_collection *c, const uint8_t *filter, size_t f
 
     for (uint32_t ixi = 0; ixi < c->index_count; ixi++) {
         dc_index *ix = &c->indexes[ixi];
+        if (ix->kind != DC_IDX_EQUALITY) continue; /* text/geo indexes have no fields to "pin" */
         bj_builder *b = bj_builder_new();
         if (!b) return BJ_ERR_OOM;
         e = bj_begin_array(b);
@@ -432,6 +661,389 @@ static void free_matches(qry_doc *matches, size_t count) {
     free(matches);
 }
 
+/* ---- $text / $near / $geoWithin: index-required special clauses --------- */
+
+typedef enum { DC_ID_HEX_STRING, DC_ID_OID_FIELD } dc_id_shape;
+
+/* Walk `entries` (a binjson ARRAY, each element an OBJECT carrying a row's
+ * id under `id_field` — a hex-string doc id for a text-index posting, or a
+ * raw OID field for an rtree hit), resolve each id to its document in
+ * `c->primary`, and emit those documents (preserving `entries`' order,
+ * e.g. BM25 rank or nearest-first) as a binjson ARRAY through
+ * *out / *out_len (malloc'd, caller frees). An id that no longer resolves
+ * to a document (deleted between being indexed and this read) is skipped,
+ * not an error. */
+static int ids_to_docs(dc_collection *c, const uint8_t *entries, size_t entries_len,
+                       const char *id_field, dc_id_shape shape,
+                       uint8_t **out, size_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+
+    cur ec = { entries, entries_len, 0 };
+    uint32_t ecount;
+    if (!e) e = array_begin(&ec, &ecount);
+    for (uint32_t i = 0; !e && i < ecount; i++) {
+        size_t estart = ec.pos;
+        e = skip_value(&ec);
+        if (e) break;
+        const uint8_t *idp; size_t idlen; int idfound;
+        e = obj_get_field(ec.d + estart, ec.pos - estart,
+                          (const uint8_t *)id_field, (uint32_t)strlen(id_field), &idp, &idlen, &idfound);
+        if (e) break;
+        if (!idfound) continue;
+
+        uint8_t oid[12];
+        if (shape == DC_ID_OID_FIELD) {
+            if (idlen != 13 || idp[0] != BJ_TYPE_OID) { e = BJ_ERR_STATE; break; }
+            memcpy(oid, idp + 1, 12);
+        } else {
+            if (idlen < 1 || idp[0] != BJ_TYPE_STRING) { e = BJ_ERR_STATE; break; }
+            cur idc = { idp, idlen, 0 };
+            const uint8_t *hexs; uint32_t hexlen;
+            e = take_string(&idc, &hexs, &hexlen);
+            if (e) break;
+            if (hex_to_oid((const char *)hexs, (int)hexlen, oid)) continue; /* malformed id: skip defensively */
+        }
+
+        bpt_key pkey; oid_key(oid, &pkey);
+        int found = 0; const uint8_t *dp; size_t dn;
+        e = bpt_search(c->primary, &pkey, &found, &dp, &dn);
+        if (e) break;
+        if (found) e = bj_put_raw(b, dp, (uint32_t)dn);
+    }
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/* {$geometry: {type:"Point", coordinates:[lng,lat]}, $maxDistance: km?} --
+ * the value of a field's $near key. Distance is in kilometers (see db.h). */
+static int parse_near(const uint8_t *cond, size_t cond_len, double *lat, double *lng,
+                      int *has_max, double *max_km) {
+    if (cond_len < 1 || cond[0] != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
+    const uint8_t *gp; size_t glen; int gfound;
+    int e = obj_get_field(cond, cond_len, (const uint8_t *)"$geometry", 9, &gp, &glen, &gfound);
+    if (e) return e;
+    if (!gfound) return BJ_ERR_STATE;
+    e = parse_geojson_point(gp, glen, lat, lng);
+    if (e) return e;
+
+    const uint8_t *mp; size_t mlen; int mfound;
+    e = obj_get_field(cond, cond_len, (const uint8_t *)"$maxDistance", 12, &mp, &mlen, &mfound);
+    if (e) return e;
+    *has_max = mfound;
+    if (mfound) {
+        cur mc = { mp, mlen, 0 };
+        e = read_number(&mc, max_km);
+        if (e) return e;
+    }
+    return BJ_OK;
+}
+
+/* {$box: [[minLng,minLat],[maxLng,maxLat]]} -- corners in either order. */
+static int parse_box(const uint8_t *val, size_t val_len,
+                     double *min_lat, double *max_lat, double *min_lng, double *max_lng) {
+    if (val_len < 1 || val[0] != BJ_TYPE_ARRAY) return BJ_ERR_STATE;
+    cur c = { val, val_len, 0 };
+    uint32_t count;
+    int e = array_begin(&c, &count);
+    if (e) return e;
+    if (count != 2) return BJ_ERR_STATE;
+
+    size_t p0 = c.pos;
+    e = skip_value(&c);
+    if (e) return e;
+    double lng0, lat0;
+    e = read_number_pair(c.d + p0, c.pos - p0, &lng0, &lat0);
+    if (e) return e;
+
+    size_t p1 = c.pos;
+    e = skip_value(&c);
+    if (e) return e;
+    double lng1, lat1;
+    e = read_number_pair(c.d + p1, c.pos - p1, &lng1, &lat1);
+    if (e) return e;
+
+    *min_lng = lng0 < lng1 ? lng0 : lng1;
+    *max_lng = lng0 < lng1 ? lng1 : lng0;
+    *min_lat = lat0 < lat1 ? lat0 : lat1;
+    *max_lat = lat0 < lat1 ? lat1 : lat0;
+    return BJ_OK;
+}
+
+/* {$center: [[lng,lat], radiusKm]} -- legacy-shaped, radius in kilometers
+ * (see db.h) rather than $centerSphere's radians. */
+static int parse_center(const uint8_t *val, size_t val_len, double *lat, double *lng, double *radius_km) {
+    if (val_len < 1 || val[0] != BJ_TYPE_ARRAY) return BJ_ERR_STATE;
+    cur c = { val, val_len, 0 };
+    uint32_t count;
+    int e = array_begin(&c, &count);
+    if (e) return e;
+    if (count != 2) return BJ_ERR_STATE;
+
+    size_t pstart = c.pos;
+    e = skip_value(&c);
+    if (e) return e;
+    double x, y;
+    e = read_number_pair(c.d + pstart, c.pos - pstart, &x, &y);
+    if (e) return e;
+
+    size_t rstart = c.pos;
+    e = skip_value(&c);
+    if (e) return e;
+    cur rc = { c.d + rstart, c.pos - rstart, 0 };
+    e = read_number(&rc, radius_km);
+    if (e) return e;
+
+    *lng = x; *lat = y;
+    return BJ_OK;
+}
+
+/* {$box: [...]} or {$center: [...]} -- the value of a field's $geoWithin key. */
+static int parse_geo_within(const uint8_t *cond, size_t cond_len, int *is_box,
+                            double *a1, double *a2, double *a3, double *a4) {
+    if (cond_len < 1 || cond[0] != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
+    const uint8_t *bp; size_t blen; int bfound;
+    int e = obj_get_field(cond, cond_len, (const uint8_t *)"$box", 4, &bp, &blen, &bfound);
+    if (e) return e;
+    if (bfound) {
+        *is_box = 1;
+        return parse_box(bp, blen, a1, a2, a3, a4); /* min_lat, max_lat, min_lng, max_lng */
+    }
+    const uint8_t *cp; size_t clen; int cfound;
+    e = obj_get_field(cond, cond_len, (const uint8_t *)"$center", 7, &cp, &clen, &cfound);
+    if (e) return e;
+    if (!cfound) return BJ_ERR_STATE;
+    *is_box = 0;
+    return parse_center(cp, clen, a1, a2, a3); /* lat, lng, radius_km */
+}
+
+/* Trim an rtree_nearest-shaped ARRAY (ascending-sorted by `distance`) to
+ * only entries with distance <= max_km, stopping at the first exceedance. */
+static int trim_by_max_distance(const uint8_t *entries, size_t entries_len, double max_km,
+                                uint8_t **out, size_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+    cur c = { entries, entries_len, 0 };
+    uint32_t count;
+    if (!e) e = array_begin(&c, &count);
+    for (uint32_t i = 0; !e && i < count; i++) {
+        size_t estart = c.pos;
+        e = skip_value(&c);
+        if (e) break;
+        const uint8_t *dp; size_t dlen; int dfound;
+        e = obj_get_field(c.d + estart, c.pos - estart, (const uint8_t *)"distance", 8, &dp, &dlen, &dfound);
+        if (e) break;
+        if (!dfound) { e = BJ_ERR_STATE; break; }
+        cur dc2 = { dp, dlen, 0 };
+        double dist;
+        e = read_number(&dc2, &dist);
+        if (e) break;
+        if (dist > max_km) break; /* ascending sorted: nothing further qualifies */
+        e = bj_put_raw(b, c.d + estart, (uint32_t)(c.pos - estart));
+    }
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/* `filter` with the top-level field `skip_key` removed -- the filter to
+ * re-apply to each candidate a special clause produces, since the clause
+ * itself already accounts for that one field/key. */
+static int build_residual_filter(const uint8_t *filter, size_t filter_len,
+                                 const uint8_t *skip_key, uint32_t skip_key_len,
+                                 uint8_t **out, size_t *out_len) {
+    cur c = { filter, filter_len, 0 };
+    uint32_t count;
+    int e = object_begin(&c, &count);
+    if (e) return e;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    e = bj_begin_object(b);
+    for (uint32_t i = 0; !e && i < count; i++) {
+        const uint8_t *kp; uint32_t klen;
+        e = take_key(&c, &kp, &klen);
+        if (e) break;
+        size_t vstart = c.pos;
+        e = skip_value(&c);
+        if (e) break;
+        if (klen == skip_key_len && memcmp(kp, skip_key, klen) == 0) continue;
+        e = bj_put_key(b, kp, klen);
+        if (!e) e = bj_put_raw(b, c.d + vstart, (uint32_t)(c.pos - vstart));
+    }
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+typedef struct {
+    int use_index;                  /* 0 = full scan (ignore the rest); 1 = use cand/residual */
+    uint8_t *cand; size_t cand_len;  /* binjson ARRAY of candidate documents, in result order */
+    uint8_t *residual; size_t residual_len; /* filter to re-apply to each candidate */
+} dc_source;
+
+static void dc_source_free(dc_source *src) {
+    free(src->cand);
+    free(src->residual);
+}
+
+/*
+ * If `filter`'s top level names a $text search, or a field's condition is
+ * exactly {$near: ...} or {$geoWithin: ...}, resolves it via the matching
+ * attached index (BJ_ERR_STATE if none exists -- these operators require
+ * an index, like real MongoDB's own $near) and writes the candidate
+ * document set + residual filter through `src`, with src->use_index = 1.
+ * src->use_index stays 0 (not an error) when `filter` has no such clause
+ * -- the caller falls back to the equality planner or a full scan. At
+ * most one clause is recognized (MongoDB itself doesn't allow combining
+ * $text with $near), and only at the filter's top level -- one nested
+ * under $and/$or/$nor is not detected (falls through to a full scan, where
+ * query.c's evaluator will reject $near/$geoWithin as unrecognized
+ * operators rather than silently ignoring them).
+ */
+static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_t filter_len, dc_source *src) {
+    memset(src, 0, sizeof(*src));
+
+    cur fc = { filter, filter_len, 0 };
+    uint32_t fcount;
+    int e = object_begin(&fc, &fcount);
+    if (e) return e;
+
+    const uint8_t *skey = NULL; uint32_t skey_len = 0;
+    const uint8_t *sval = NULL; size_t sval_len = 0;
+    int is_text = 0;
+
+    for (uint32_t i = 0; i < fcount; i++) {
+        const uint8_t *kp; uint32_t klen;
+        e = take_key(&fc, &kp, &klen);
+        if (e) return e;
+        size_t vstart = fc.pos;
+        e = skip_value(&fc);
+        if (e) return e;
+        const uint8_t *v = fc.d + vstart; size_t vlen = fc.pos - vstart;
+
+        if (klen == 5 && memcmp(kp, "$text", 5) == 0) {
+            skey = kp; skey_len = klen; sval = v; sval_len = vlen; is_text = 1;
+            break;
+        }
+        if (vlen >= 1 && v[0] == BJ_TYPE_OBJECT) {
+            cur vc = { v, vlen, 0 };
+            uint32_t vcount;
+            if (!object_begin(&vc, &vcount) && vcount == 1) {
+                const uint8_t *okp; uint32_t oklen;
+                if (!take_key(&vc, &okp, &oklen)) {
+                    if ((oklen == 5 && memcmp(okp, "$near", 5) == 0) ||
+                        (oklen == 10 && memcmp(okp, "$geoWithin", 10) == 0)) {
+                        skey = kp; skey_len = klen; sval = v; sval_len = vlen; is_text = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!skey) return BJ_OK; /* nothing special; src->use_index stays 0 */
+
+    uint8_t *raw = NULL; size_t raw_len = 0; /* entries array, before id resolution */
+
+    if (is_text) {
+        dc_index *tix = NULL;
+        for (uint32_t i = 0; i < c->index_count; i++) {
+            if (c->indexes[i].kind == DC_IDX_TEXT) { tix = &c->indexes[i]; break; }
+        }
+        if (!tix) return BJ_ERR_STATE; /* $text requires a text index */
+
+        const uint8_t *sp; size_t slen; int sfound;
+        e = obj_get_field(sval, sval_len, (const uint8_t *)"$search", 7, &sp, &slen, &sfound);
+        if (e) return e;
+        if (!sfound || slen < 1 || sp[0] != BJ_TYPE_STRING) return BJ_ERR_STATE;
+        cur sc = { sp, slen, 0 };
+        const uint8_t *stext; uint32_t stext_len;
+        e = take_string(&sc, &stext, &stext_len);
+        if (e) return e;
+
+        e = tix_query(tix->tix_index, tix->tix_doc_terms, tix->tix_doc_lengths,
+                     (const char *)stext, (int)stext_len, &raw, &raw_len);
+        if (e) { free(raw); return e; }
+
+        e = ids_to_docs(c, raw, raw_len, "id", DC_ID_HEX_STRING, &src->cand, &src->cand_len);
+        free(raw);
+        if (e) return e;
+    } else {
+        dc_index *ix = NULL;
+        for (uint32_t i = 0; i < c->index_count; i++) {
+            if (c->indexes[i].kind == DC_IDX_GEO &&
+                c->indexes[i].geo_field_len == skey_len &&
+                memcmp(c->indexes[i].geo_field, skey, skey_len) == 0) {
+                ix = &c->indexes[i]; break;
+            }
+        }
+        if (!ix) return BJ_ERR_STATE; /* $near/$geoWithin requires a geo index on this field */
+
+        cur vc = { sval, sval_len, 0 };
+        uint32_t vcount;
+        e = object_begin(&vc, &vcount);
+        if (e) return e;
+        const uint8_t *okp; uint32_t oklen;
+        e = take_key(&vc, &okp, &oklen);
+        if (e) return e;
+        size_t ovstart = vc.pos;
+        e = skip_value(&vc);
+        if (e) return e;
+        const uint8_t *oval = vc.d + ovstart; size_t oval_len = vc.pos - ovstart;
+
+        const uint8_t *tmp = NULL; size_t tmp_len = 0; /* rtree's transient output */
+
+        if (oklen == 5 && memcmp(okp, "$near", 5) == 0) {
+            double lat, lng; int has_max = 0; double max_km = 0;
+            e = parse_near(oval, oval_len, &lat, &lng, &has_max, &max_km);
+            if (e) return e;
+            e = rtree_nearest(ix->rt, lat, lng, (int)rtree_size(ix->rt), &tmp, &tmp_len);
+            if (e) return e;
+            if (has_max) e = trim_by_max_distance(tmp, tmp_len, max_km, &raw, &raw_len);
+            else e = dbuf_dup(tmp, tmp_len, &raw, &raw_len);
+            if (e) { free(raw); return e; }
+        } else if (oklen == 10 && memcmp(okp, "$geoWithin", 10) == 0) {
+            int is_box = 0; double a1 = 0, a2 = 0, a3 = 0, a4 = 0;
+            e = parse_geo_within(oval, oval_len, &is_box, &a1, &a2, &a3, &a4);
+            if (e) return e;
+            if (is_box) e = rtree_search_bbox(ix->rt, a1, a2, a3, a4, &tmp, &tmp_len);
+            else e = rtree_search_radius(ix->rt, a1, a2, a3, &tmp, &tmp_len);
+            if (e) return e;
+            e = dbuf_dup(tmp, tmp_len, &raw, &raw_len);
+            if (e) { free(raw); return e; }
+        } else {
+            return BJ_ERR_STATE; /* {field: {$near/$geoWithin: ...}} was the only shape checked for above */
+        }
+
+        e = ids_to_docs(c, raw, raw_len, "objectId", DC_ID_OID_FIELD, &src->cand, &src->cand_len);
+        free(raw);
+        if (e) return e;
+    }
+
+    e = build_residual_filter(filter, filter_len, skey, skey_len, &src->residual, &src->residual_len);
+    if (e) { free(src->cand); src->cand = NULL; return e; }
+    src->use_index = 1;
+    return BJ_OK;
+}
+
 /* ---- CRUD ---------------------------------------------------------------- */
 
 int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
@@ -465,6 +1077,31 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         *found = 1;
         return dbuf_dup(p, n, out, out_len);
     }
+
+    dc_source src;
+    e = resolve_special_source(c, filter, filter_len, &src);
+    if (e) { dc_source_free(&src); return e; }
+    if (src.use_index) {
+        cur cc = { src.cand, src.cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
+            if (e) break;
+            if (m) {
+                *found = 1;
+                e = dbuf_dup(cc.d + dstart, cc.pos - dstart, out, out_len);
+                break;
+            }
+        }
+        dc_source_free(&src);
+        return e;
+    }
+    dc_source_free(&src);
 
     dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
     int planned = 0;
@@ -527,13 +1164,38 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     int e = qry_validate_options(opts);
     if (e) return e;
 
+    dc_source src;
+    e = resolve_special_source(c, filter, filter_len, &src);
+    if (e) { dc_source_free(&src); return e; }
+
+    qry_doc *matches = NULL;
+    size_t match_count = 0, match_cap = 0;
+
+    if (src.use_index) {
+        cur cc = { src.cand, src.cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
+            if (e) break;
+        }
+        dc_source_free(&src);
+        if (!e) e = qry_collect(matches, match_count, opts, out, out_len);
+        free_matches(matches, match_count);
+        return e;
+    }
+    dc_source_free(&src);
+
     dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
     int planned = 0;
     e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
     if (e) return e;
-
-    qry_doc *matches = NULL;
-    size_t match_count = 0, match_cap = 0;
 
     if (planned) {
         uint8_t *cand = NULL; size_t cand_len = 0;
@@ -800,21 +1462,15 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     int e = upd_validate(update, update_len);
     if (e) return e;
 
-    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
-    int planned = 0;
-    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
-    if (e) return e;
+    dc_source src;
+    e = resolve_special_source(c, filter, filter_len, &src);
+    if (e) { dc_source_free(&src); return e; }
 
     qry_doc *matches = NULL;
     size_t match_count = 0, match_cap = 0;
 
-    if (planned) {
-        uint8_t *cand = NULL; size_t cand_len = 0;
-        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
-                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
-        free(ix_values);
-        if (e) { free(cand); return e; }
-        cur cc = { cand, cand_len, 0 };
+    if (src.use_index) {
+        cur cc = { src.cand, src.cand_len, 0 };
         uint32_t ccount;
         e = array_begin(&cc, &ccount);
         for (uint32_t i = 0; !e && i < ccount; i++) {
@@ -822,30 +1478,61 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             e = skip_value(&cc);
             if (e) break;
             int m = 0;
-            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
             if (e) break;
             if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
             if (e) break;
         }
-        free(cand);
+        dc_source_free(&src);
     } else {
-        free(ix_values);
-        bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
-        if (!cur_h) e = BJ_ERR_OOM;
-        while (!e && cur_h) {
-            bpt_key k; const uint8_t *val; size_t vlen;
-            int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
-            if (r < 0) { e = r; break; }
-            if (r == 0) break;
-            int m = 0;
-            e = qry_matches(val, vlen, filter, filter_len, &m);
-            if (e) break;
-            if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
-        }
-        if (cur_h) bpt_cursor_close(cur_h);
-    }
+        dc_source_free(&src);
 
-    if (!e && match_count == 0) {
+        dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+        int planned = 0;
+        e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+
+        if (!e && planned) {
+            uint8_t *cand = NULL; size_t cand_len = 0;
+            e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                            ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+            free(ix_values);
+            if (e) { free(cand); }
+            else {
+                cur cc = { cand, cand_len, 0 };
+                uint32_t ccount;
+                e = array_begin(&cc, &ccount);
+                for (uint32_t i = 0; !e && i < ccount; i++) {
+                    size_t dstart = cc.pos;
+                    e = skip_value(&cc);
+                    if (e) break;
+                    int m = 0;
+                    e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+                    if (e) break;
+                    if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
+                    if (e) break;
+                }
+                free(cand);
+            }
+        } else if (!e) {
+            free(ix_values);
+            bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
+            if (!cur_h) e = BJ_ERR_OOM;
+            while (!e && cur_h) {
+                bpt_key k; const uint8_t *val; size_t vlen;
+                int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+                if (r < 0) { e = r; break; }
+                if (r == 0) break;
+                int m = 0;
+                e = qry_matches(val, vlen, filter, filter_len, &m);
+                if (e) break;
+                if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
+            }
+            if (cur_h) bpt_cursor_close(cur_h);
+        }
+    }
+    if (e) { free_matches(matches, match_count); return e; }
+
+    if (match_count == 0) {
         if (upsert) {
             uint8_t *seed = NULL; size_t seed_len = 0;
             e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
@@ -859,7 +1546,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             free(spliced);
             if (!e) *upserted = 1;
         }
-    } else if (!e) {
+    } else {
         *matched_count = (int64_t)match_count;
         for (size_t i = 0; !e && i < match_count; i++) {
             uint8_t id[12];
@@ -888,6 +1575,30 @@ int dc_count(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int64
     int e = object_begin(&cu, &fcount);
     if (e) return e;
     if (fcount == 0) { *out_count = bpt_size(c->primary); return BJ_OK; }
+
+    dc_source src;
+    e = resolve_special_source(c, filter, filter_len, &src);
+    if (e) { dc_source_free(&src); return e; }
+    if (src.use_index) {
+        int64_t n = 0;
+        cur cc = { src.cand, src.cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
+            if (e) break;
+            if (m) n++;
+        }
+        dc_source_free(&src);
+        if (e) return e;
+        *out_count = n;
+        return BJ_OK;
+    }
+    dc_source_free(&src);
 
     dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
     int planned = 0;
