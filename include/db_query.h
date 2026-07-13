@@ -55,6 +55,30 @@ int qry_matches(const uint8_t *doc, size_t doc_len,
                 const uint8_t *filter, size_t filter_len, int *out_matches);
 
 /*
+ * Resolve dot-separated `path` (e.g. "a.b.c") against `doc`, descending
+ * through nested OBJECTs only -- same rule qry_matches's field-path
+ * handling uses (see this header's top comment). *found is 0 if any
+ * segment is missing, or a non-terminal segment isn't itself an OBJECT.
+ * Exposed for db.c's distinct(), which needs the same path resolution
+ * qry_matches uses internally.
+ */
+int qry_resolve_path(const uint8_t *doc, size_t doc_len,
+                     const uint8_t *path, uint32_t path_len,
+                     const uint8_t **val_ptr, size_t *val_len, int *found);
+
+/* A growable list of byte spans (views into someone else's buffer, not
+ * owned) plus byte-equality comparison -- exposed for db.c's distinct(),
+ * which needs the same "accumulate candidate values, dedup by exact
+ * encoded-byte equality" shape qry_matches's own array-element candidate
+ * list (db_query.c) already implements. */
+typedef struct { const uint8_t *ptr; size_t len; } val_span;
+typedef struct { val_span *items; uint32_t count, cap; } val_list;
+
+int val_list_push(val_list *l, const uint8_t *ptr, size_t len);
+void val_list_free(val_list *l);
+int value_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen);
+
+/*
  * True (via *is_expr) iff `value` is a binjson OBJECT whose keys are all
  * $-prefixed (an "operator expression", e.g. {$gt: 5}) rather than a
  * literal to match by equality. An empty object {} is a literal (matches

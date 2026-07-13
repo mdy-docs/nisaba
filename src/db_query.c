@@ -12,9 +12,9 @@
 
 /* Resolve dot-separated `path` against `doc`, descending through nested
  * OBJECTs only -- see db_query.h's top comment for the array/index limitation. */
-static int resolve_path(const uint8_t *doc, size_t doc_len,
-                        const uint8_t *path, uint32_t path_len,
-                        const uint8_t **val_ptr, size_t *val_len, int *found) {
+int qry_resolve_path(const uint8_t *doc, size_t doc_len,
+                     const uint8_t *path, uint32_t path_len,
+                     const uint8_t **val_ptr, size_t *val_len, int *found) {
     uint32_t start = 0;
     const uint8_t *cur_obj = doc;
     size_t cur_len = doc_len;
@@ -39,11 +39,10 @@ static int resolve_path(const uint8_t *doc, size_t doc_len,
 }
 
 /* ---- candidate values (array element matching) -------------------------- */
+/* val_span/val_list themselves are declared in db_query.h (also used by
+ * db.c's distinct()). */
 
-typedef struct { const uint8_t *ptr; size_t len; } val_span;
-typedef struct { val_span *items; uint32_t count, cap; } val_list;
-
-static int val_list_push(val_list *l, const uint8_t *ptr, size_t len) {
+int val_list_push(val_list *l, const uint8_t *ptr, size_t len) {
     if (l->count == l->cap) {
         uint32_t ncap = l->cap ? l->cap * 2 : 4;
         val_span *nb = (val_span *)realloc(l->items, ncap * sizeof(val_span));
@@ -56,7 +55,7 @@ static int val_list_push(val_list *l, const uint8_t *ptr, size_t len) {
     return BJ_OK;
 }
 
-static void val_list_free(val_list *l) {
+void val_list_free(val_list *l) {
     free(l->items);
     l->items = NULL; l->count = l->cap = 0;
 }
@@ -83,7 +82,7 @@ static int expand_candidates(const uint8_t *val, size_t val_len, val_list *out) 
 
 /* ---- value comparison ---------------------------------------------------- */
 
-static int value_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+int value_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
     return alen == blen && (alen == 0 || memcmp(a, b, alen) == 0);
 }
 
@@ -259,7 +258,7 @@ static int eval_field_condition(const uint8_t *doc, size_t doc_len,
                                 const uint8_t *path, uint32_t path_len,
                                 const uint8_t *cond, size_t cond_len, int *out_match) {
     const uint8_t *vp = NULL; size_t vl = 0; int found = 0;
-    int e = resolve_path(doc, doc_len, path, path_len, &vp, &vl, &found);
+    int e = qry_resolve_path(doc, doc_len, path, path_len, &vp, &vl, &found);
     if (e) return e;
 
     val_list cands; memset(&cands, 0, sizeof(cands));
@@ -396,8 +395,8 @@ static int compare_by_sort(const uint8_t *a, size_t alen, const uint8_t *b, size
 
         const uint8_t *av = NULL; size_t al = 0; int af = 0;
         const uint8_t *bv = NULL; size_t bl = 0; int bf = 0;
-        resolve_path(a, alen, kp, klen, &av, &al, &af);
-        resolve_path(b, blen, kp, klen, &bv, &bl, &bf);
+        qry_resolve_path(a, alen, kp, klen, &av, &al, &af);
+        qry_resolve_path(b, blen, kp, klen, &bv, &bl, &bf);
 
         int cmp;
         if (!af && !bf) cmp = 0;

@@ -105,6 +105,16 @@ EMSCRIPTEN_KEEPALIVE int dcw_insert_one(dc_collection *c, const uint8_t *doc, in
     return dc_insert_one(c, doc, (uint32_t)doc_len);
 }
 
+/* `docs` is a binjson ARRAY; the out slot receives a binjson ARRAY of one
+ * INT error code per attempted document (see dc_insert_many). Returns 0 on
+ * success (regardless of individual document outcomes, which JS inspects
+ * in the out slot), negative if the result array itself couldn't be built. */
+EMSCRIPTEN_KEEPALIVE int dcw_insert_many(dcw_out *o, dc_collection *c,
+        const uint8_t *docs, int docs_len, int ordered) {
+    reset_out(o);
+    return dc_insert_many(c, docs, (uint32_t)docs_len, ordered, &o->buf, &o->len);
+}
+
 /* Returns 1 if found (document in the out slot), 0 if not, negative on error. */
 EMSCRIPTEN_KEEPALIVE int dcw_find_one(dcw_out *o, dc_collection *c,
                                       const uint8_t *filter, int filter_len) {
@@ -142,6 +152,25 @@ EMSCRIPTEN_KEEPALIVE int dcw_delete_one(dc_collection *c, const uint8_t *filter,
     return deleted ? 1 : 0;
 }
 
+/* Returns the number deleted, or a negative error code (mirrors dcw_count's
+ * double-return-for-int64 pattern). */
+EMSCRIPTEN_KEEPALIVE double dcw_delete_many(dc_collection *c, const uint8_t *filter, int filter_len) {
+    int64_t n = 0;
+    int e = dc_delete_many(c, filter, (uint32_t)filter_len, &n);
+    return e ? (double)e : (double)n;
+}
+
+/* Returns 1 if *out holds a document (the pre-image), 0 if not, negative on
+ * error. */
+EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_delete(dcw_out *o, dc_collection *c,
+        const uint8_t *filter, int filter_len) {
+    reset_out(o);
+    int found = 0;
+    int e = dc_find_one_and_delete(c, filter, (uint32_t)filter_len, &found, &o->buf, &o->len);
+    if (e) return e;
+    return found ? 1 : 0;
+}
+
 /* Returns 0 (no match, no upsert), 1 (matched and replaced), 2 (upserted),
  * or a negative error. */
 EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dc_collection *c,
@@ -156,6 +185,22 @@ EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dc_collection *c,
     return result;
 }
 
+/* Returns 1 if *out holds a document (pre- or post-image per `return_new`),
+ * 0 if not, negative on error -- see dc_find_one_and_replace's doc comment
+ * for exactly when. */
+EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_replace(dcw_out *o, dc_collection *c,
+        const uint8_t *filter, int filter_len,
+        const uint8_t *replacement, int replacement_len,
+        const uint8_t *default_id, int upsert, int return_new) {
+    reset_out(o);
+    int found = 0;
+    int e = dc_find_one_and_replace(c, filter, (uint32_t)filter_len,
+                                    replacement, (uint32_t)replacement_len,
+                                    default_id, upsert, return_new, &found, &o->buf, &o->len);
+    if (e) return e;
+    return found ? 1 : 0;
+}
+
 /* Returns 0 (no match, no upsert), 1 (matched and updated), 2 (upserted),
  * or a negative error. */
 EMSCRIPTEN_KEEPALIVE int dcw_update_one(dc_collection *c,
@@ -168,6 +213,22 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_one(dc_collection *c,
                           default_id, upsert, &result);
     if (e) return e;
     return result;
+}
+
+/* Returns 1 if *out holds a document (pre- or post-image per `return_new`),
+ * 0 if not, negative on error -- see dc_find_one_and_update's doc comment
+ * for exactly when. */
+EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_update(dcw_out *o, dc_collection *c,
+        const uint8_t *filter, int filter_len,
+        const uint8_t *update, int update_len,
+        const uint8_t *default_id, int upsert, int return_new) {
+    reset_out(o);
+    int found = 0;
+    int e = dc_find_one_and_update(c, filter, (uint32_t)filter_len,
+                                   update, (uint32_t)update_len,
+                                   default_id, upsert, return_new, &found, &o->buf, &o->len);
+    if (e) return e;
+    return found ? 1 : 0;
 }
 
 /* Writes a binjson OBJECT { matchedCount: number, upserted: bool } into the
@@ -205,6 +266,15 @@ EMSCRIPTEN_KEEPALIVE double dcw_count(dc_collection *c, const uint8_t *filter, i
     int64_t n = 0;
     int e = dc_count(c, filter, (uint32_t)filter_len, &n);
     return e ? (double)e : (double)n;
+}
+
+/* The out slot receives a binjson ARRAY of unique values. Returns 0 on
+ * success, negative on error. */
+EMSCRIPTEN_KEEPALIVE int dcw_distinct(dcw_out *o, dc_collection *c,
+        const char *field, int field_len,
+        const uint8_t *filter, int filter_len) {
+    reset_out(o);
+    return dc_distinct(c, field, field_len, filter, (uint32_t)filter_len, &o->buf, &o->len);
 }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *dcw_out_ptr(dcw_out *o) { return o->buf; }

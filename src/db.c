@@ -490,6 +490,26 @@ static int filter_is_id_only(const uint8_t *filter, size_t filter_len,
     return BJ_OK;
 }
 
+/* Build a binjson {_id: <oid>} filter from a raw 12-byte id -- the inverse
+ * of filter_is_id_only. Used by the find_one_and_* family to re-target the
+ * exact document an initial dc_find_one already captured, so a second
+ * internal find/update/delete can never land on a different document. */
+static int build_id_filter(const uint8_t id[12], uint8_t **out, size_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"_id", 3);
+    if (!e) e = bj_put_oid(b, id);
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
 /* ---- geo/text helpers ------------------------------------------------------ */
 
 static void oid_to_hex(const uint8_t id[12], char hex[24]) {
@@ -1255,6 +1275,99 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
     return BJ_OK;
 }
 
+/*
+ * Gather every document in `c` matching `filter` (special $text/$near/
+ * $geoWithin source, else the equality-index planner, else a full scan --
+ * the same dispatch dc_find_one/dc_count use) into a freshly built qry_doc
+ * array. Each entry is a dbuf_dup'd copy (push_match's own doing),
+ * independent of any live scan state, so a caller may safely mutate the
+ * primary tree/indexes while iterating the result (dc_update_many/
+ * dc_delete_many both do). Caller frees via free_matches. Shared by
+ * dc_find, dc_update_many, dc_delete_many and dc_distinct -- dc_count
+ * deliberately does not use this: it only needs a count, not materialized
+ * document bytes, and this would regress a large unfiltered count from
+ * O(1) to O(every match held in memory) for no benefit.
+ */
+static int gather_matches(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                          qry_doc **out_matches, size_t *out_count) {
+    *out_matches = NULL; *out_count = 0;
+
+    dc_source src;
+    int e = resolve_special_source(c, filter, filter_len, &src);
+    if (e) { dc_source_free(&src); return e; }
+
+    qry_doc *matches = NULL;
+    size_t match_count = 0, match_cap = 0;
+
+    if (src.use_index) {
+        cur cc = { src.cand, src.cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
+            if (e) break;
+        }
+        dc_source_free(&src);
+        if (e) { free_matches(matches, match_count); return e; }
+        *out_matches = matches; *out_count = match_count;
+        return BJ_OK;
+    }
+    dc_source_free(&src);
+
+    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+    int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    if (e) return e;
+
+    if (planned) {
+        uint8_t *cand = NULL; size_t cand_len = 0;
+        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+        free(ix_values);
+        if (e) { free(cand); return e; }
+
+        cur cc = { cand, cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
+            if (e) break;
+        }
+        free(cand);
+    } else {
+        free(ix_values);
+        bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
+        if (!cur_h) e = BJ_ERR_OOM;
+        while (!e && cur_h) {
+            bpt_key k; const uint8_t *val; size_t vlen;
+            int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+            if (r < 0) { e = r; break; }
+            if (r == 0) break;
+            int m = 0;
+            e = qry_matches(val, vlen, filter, filter_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
+        }
+        if (cur_h) bpt_cursor_close(cur_h);
+    }
+
+    if (e) { free_matches(matches, match_count); return e; }
+    *out_matches = matches; *out_count = match_count;
+    return BJ_OK;
+}
+
 /* ---- CRUD ---------------------------------------------------------------- */
 
 int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
@@ -1272,6 +1385,35 @@ int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
     e = add_to_indexes(c, doc, doc_len, id);
     if (e) return e;
     return commit_journal(c);
+}
+
+int dc_insert_many(dc_collection *c, const uint8_t *docs, uint32_t docs_len,
+                   int ordered, uint8_t **out, size_t *out_len) {
+    *out = NULL; *out_len = 0;
+    cur cu = { docs, docs_len, 0 };
+    uint32_t count;
+    int e = array_begin(&cu, &count);
+    if (e) return e;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    e = bj_begin_array(b);
+    for (uint32_t i = 0; !e && i < count; i++) {
+        size_t dstart = cu.pos;
+        e = skip_value(&cu);
+        if (e) break;
+        int rc = dc_insert_one(c, cu.d + dstart, (uint32_t)(cu.pos - dstart));
+        e = bj_put_int(b, rc);
+        if (!e && rc != BJ_OK && ordered) break; /* result array ends up shorter than docs */
+    }
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    return e;
 }
 
 int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
@@ -1377,78 +1519,11 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     int e = qry_validate_options(opts);
     if (e) return e;
 
-    dc_source src;
-    e = resolve_special_source(c, filter, filter_len, &src);
-    if (e) { dc_source_free(&src); return e; }
-
-    qry_doc *matches = NULL;
-    size_t match_count = 0, match_cap = 0;
-
-    if (src.use_index) {
-        cur cc = { src.cand, src.cand_len, 0 };
-        uint32_t ccount;
-        e = array_begin(&cc, &ccount);
-        for (uint32_t i = 0; !e && i < ccount; i++) {
-            size_t dstart = cc.pos;
-            e = skip_value(&cc);
-            if (e) break;
-            int m = 0;
-            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
-            if (e) break;
-            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
-            if (e) break;
-        }
-        dc_source_free(&src);
-        if (!e) e = qry_collect(matches, match_count, opts, out, out_len);
-        free_matches(matches, match_count);
-        return e;
-    }
-    dc_source_free(&src);
-
-    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
-    int planned = 0;
-    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    qry_doc *matches; size_t match_count;
+    e = gather_matches(c, filter, filter_len, &matches, &match_count);
     if (e) return e;
 
-    if (planned) {
-        uint8_t *cand = NULL; size_t cand_len = 0;
-        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
-                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
-        free(ix_values);
-        if (e) { free(cand); return e; }
-
-        cur cc = { cand, cand_len, 0 };
-        uint32_t ccount;
-        e = array_begin(&cc, &ccount);
-        for (uint32_t i = 0; !e && i < ccount; i++) {
-            size_t dstart = cc.pos;
-            e = skip_value(&cc);
-            if (e) break;
-            int m = 0;
-            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
-            if (e) break;
-            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
-            if (e) break;
-        }
-        free(cand);
-    } else {
-        free(ix_values);
-        bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
-        if (!cur_h) e = BJ_ERR_OOM;
-        while (!e && cur_h) {
-            bpt_key k; const uint8_t *val; size_t vlen;
-            int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
-            if (r < 0) { e = r; break; }
-            if (r == 0) break;
-            int m = 0;
-            e = qry_matches(val, vlen, filter, filter_len, &m);
-            if (e) break;
-            if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
-        }
-        if (cur_h) bpt_cursor_close(cur_h);
-    }
-
-    if (!e) e = qry_collect(matches, match_count, opts, out, out_len);
+    e = qry_collect(matches, match_count, opts, out, out_len);
     free_matches(matches, match_count);
     return e;
 }
@@ -1472,6 +1547,52 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
     e = commit_journal(c);
     if (e) return e;
     *deleted = 1;
+    return BJ_OK;
+}
+
+int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                   int64_t *deleted_count) {
+    *deleted_count = 0;
+    qry_doc *matches; size_t match_count;
+    int e = gather_matches(c, filter, filter_len, &matches, &match_count);
+    if (e) return e;
+
+    for (size_t i = 0; !e && i < match_count; i++) {
+        uint8_t id[12];
+        e = dc_get_id(matches[i].ptr, (uint32_t)matches[i].len, id);
+        if (!e) e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
+        if (!e) {
+            bpt_key key; oid_key(id, &key);
+            e = bpt_delete(c->primary, &key);
+        }
+        if (!e) e = commit_journal(c);
+        if (!e) (*deleted_count)++;
+    }
+
+    free_matches(matches, match_count);
+    return e;
+}
+
+int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                           int *found, uint8_t **out, size_t *out_len) {
+    *found = 0; *out = NULL; *out_len = 0;
+    int f = 0; uint8_t *doc = NULL; size_t doc_len = 0;
+    int e = dc_find_one(c, filter, filter_len, &f, &doc, &doc_len);
+    if (e) { free(doc); return e; }
+    if (!f) { free(doc); return BJ_OK; }
+
+    uint8_t id[12];
+    e = dc_get_id(doc, (uint32_t)doc_len, id);
+    if (e) { free(doc); return e; }
+    uint8_t *idfilter = NULL; size_t idfilter_len = 0;
+    e = build_id_filter(id, &idfilter, &idfilter_len);
+    if (e) { free(doc); return e; }
+    int deleted = 0;
+    e = dc_delete_one(c, idfilter, (uint32_t)idfilter_len, &deleted);
+    free(idfilter);
+    if (e) { free(doc); return e; }
+
+    *found = 1; *out = doc; *out_len = doc_len;
     return BJ_OK;
 }
 
@@ -1574,6 +1695,46 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     return BJ_OK;
 }
 
+int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                            const uint8_t *replacement, uint32_t replacement_len,
+                            const uint8_t default_id[12], int upsert, int return_new,
+                            int *found, uint8_t **out, size_t *out_len) {
+    *found = 0; *out = NULL; *out_len = 0;
+
+    int before_found = 0; uint8_t *before = NULL; size_t before_len = 0;
+    int e = dc_find_one(c, filter, filter_len, &before_found, &before, &before_len);
+    if (e) { free(before); return e; }
+    if (!before_found && !upsert) { free(before); return BJ_OK; }
+
+    int result = 0;
+    uint8_t target_id[12];
+    if (before_found) {
+        e = dc_get_id(before, (uint32_t)before_len, target_id);
+        uint8_t *idfilter = NULL; size_t idfilter_len = 0;
+        if (!e) e = build_id_filter(target_id, &idfilter, &idfilter_len);
+        if (!e) e = dc_replace_one(c, idfilter, (uint32_t)idfilter_len, replacement, replacement_len, default_id, 0, &result);
+        free(idfilter);
+    } else {
+        e = dc_replace_one(c, filter, filter_len, replacement, replacement_len, default_id, 1, &result);
+        memcpy(target_id, default_id, 12);
+    }
+    if (e) { free(before); return e; }
+
+    if (!return_new) {
+        if (before_found) { *found = 1; *out = before; *out_len = before_len; return BJ_OK; }
+        free(before);
+        return BJ_OK;
+    }
+    free(before);
+
+    uint8_t *idfilter2 = NULL; size_t idfilter2_len = 0;
+    e = build_id_filter(target_id, &idfilter2, &idfilter2_len);
+    if (e) return e;
+    e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, found, out, out_len);
+    free(idfilter2);
+    return e;
+}
+
 /*
  * A base document for an upsert: `filter`'s top-level bare-literal
  * conditions (fields not wrapped in an operator expression). Fields under
@@ -1670,6 +1831,51 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     return BJ_OK;
 }
 
+int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                           const uint8_t *update, uint32_t update_len,
+                           const uint8_t default_id[12], int upsert, int return_new,
+                           int *found, uint8_t **out, size_t *out_len) {
+    *found = 0; *out = NULL; *out_len = 0;
+
+    int e = upd_validate(update, update_len);
+    if (e) return e;
+
+    int before_found = 0; uint8_t *before = NULL; size_t before_len = 0;
+    e = dc_find_one(c, filter, filter_len, &before_found, &before, &before_len);
+    if (e) { free(before); return e; }
+    if (!before_found && !upsert) { free(before); return BJ_OK; }
+
+    int result = 0;
+    uint8_t target_id[12];
+    if (before_found) {
+        /* Re-target the exact matched document by _id so dc_update_one's
+         * own internal re-scan can never land on a different document. */
+        e = dc_get_id(before, (uint32_t)before_len, target_id);
+        uint8_t *idfilter = NULL; size_t idfilter_len = 0;
+        if (!e) e = build_id_filter(target_id, &idfilter, &idfilter_len);
+        if (!e) e = dc_update_one(c, idfilter, (uint32_t)idfilter_len, update, update_len, default_id, 0, &result);
+        free(idfilter);
+    } else {
+        e = dc_update_one(c, filter, filter_len, update, update_len, default_id, 1, &result);
+        memcpy(target_id, default_id, 12); /* only consulted below when return_new */
+    }
+    if (e) { free(before); return e; }
+
+    if (!return_new) {
+        if (before_found) { *found = 1; *out = before; *out_len = before_len; return BJ_OK; }
+        free(before);
+        return BJ_OK; /* upsert + "before": no prior state, matches real MongoDB's null */
+    }
+    free(before);
+
+    uint8_t *idfilter2 = NULL; size_t idfilter2_len = 0;
+    e = build_id_filter(target_id, &idfilter2, &idfilter2_len);
+    if (e) return e;
+    e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, found, out, out_len);
+    free(idfilter2);
+    return e;
+}
+
 int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *update, uint32_t update_len,
                    const uint8_t default_id[12], int upsert,
@@ -1679,75 +1885,9 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     int e = upd_validate(update, update_len);
     if (e) return e;
 
-    dc_source src;
-    e = resolve_special_source(c, filter, filter_len, &src);
-    if (e) { dc_source_free(&src); return e; }
-
-    qry_doc *matches = NULL;
-    size_t match_count = 0, match_cap = 0;
-
-    if (src.use_index) {
-        cur cc = { src.cand, src.cand_len, 0 };
-        uint32_t ccount;
-        e = array_begin(&cc, &ccount);
-        for (uint32_t i = 0; !e && i < ccount; i++) {
-            size_t dstart = cc.pos;
-            e = skip_value(&cc);
-            if (e) break;
-            int m = 0;
-            e = qry_matches(cc.d + dstart, cc.pos - dstart, src.residual, src.residual_len, &m);
-            if (e) break;
-            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
-            if (e) break;
-        }
-        dc_source_free(&src);
-    } else {
-        dc_source_free(&src);
-
-        dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
-        int planned = 0;
-        e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
-
-        if (!e && planned) {
-            uint8_t *cand = NULL; size_t cand_len = 0;
-            e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
-                                            ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
-            free(ix_values);
-            if (e) { free(cand); }
-            else {
-                cur cc = { cand, cand_len, 0 };
-                uint32_t ccount;
-                e = array_begin(&cc, &ccount);
-                for (uint32_t i = 0; !e && i < ccount; i++) {
-                    size_t dstart = cc.pos;
-                    e = skip_value(&cc);
-                    if (e) break;
-                    int m = 0;
-                    e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
-                    if (e) break;
-                    if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
-                    if (e) break;
-                }
-                free(cand);
-            }
-        } else if (!e) {
-            free(ix_values);
-            bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
-            if (!cur_h) e = BJ_ERR_OOM;
-            while (!e && cur_h) {
-                bpt_key k; const uint8_t *val; size_t vlen;
-                int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
-                if (r < 0) { e = r; break; }
-                if (r == 0) break;
-                int m = 0;
-                e = qry_matches(val, vlen, filter, filter_len, &m);
-                if (e) break;
-                if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
-            }
-            if (cur_h) bpt_cursor_close(cur_h);
-        }
-    }
-    if (e) { free_matches(matches, match_count); return e; }
+    qry_doc *matches; size_t match_count;
+    e = gather_matches(c, filter, filter_len, &matches, &match_count);
+    if (e) return e;
 
     if (match_count == 0) {
         if (upsert) {
@@ -1866,4 +2006,69 @@ int dc_count(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int64
     if (rc) return rc;
     *out_count = n;
     return BJ_OK;
+}
+
+int dc_distinct(dc_collection *c, const char *field, int field_len,
+                const uint8_t *filter, uint32_t filter_len,
+                uint8_t **out, size_t *out_len) {
+    *out = NULL; *out_len = 0;
+    if (field_len <= 0) return BJ_ERR_STATE;
+
+    qry_doc *matches; size_t match_count;
+    int e = gather_matches(c, filter, filter_len, &matches, &match_count);
+    if (e) return e;
+
+    /* Unique values by exact encoded-byte equality (same rationale as every
+     * other equality in this codebase); an array field's *elements* are
+     * the candidates, not the array itself, matching real MongoDB's
+     * distinct(). Result set is normally small, so a linear value_eq scan
+     * per candidate is fine without a hash set. */
+    val_list uniq; memset(&uniq, 0, sizeof(uniq));
+    for (size_t i = 0; !e && i < match_count; i++) {
+        const uint8_t *vp; size_t vl; int found = 0;
+        e = qry_resolve_path(matches[i].ptr, matches[i].len,
+                             (const uint8_t *)field, (uint32_t)field_len, &vp, &vl, &found);
+        if (e) break;
+        if (!found) continue;
+
+        if (vl >= 1 && vp[0] == BJ_TYPE_ARRAY) {
+            cur ac = { vp, vl, 0 };
+            uint32_t acount;
+            e = array_begin(&ac, &acount);
+            for (uint32_t j = 0; !e && j < acount; j++) {
+                size_t estart = ac.pos;
+                e = skip_value(&ac);
+                if (e) break;
+                int dup = 0;
+                for (uint32_t k = 0; k < uniq.count; k++) {
+                    if (value_eq(uniq.items[k].ptr, uniq.items[k].len, ac.d + estart, ac.pos - estart)) { dup = 1; break; }
+                }
+                if (!dup) e = val_list_push(&uniq, ac.d + estart, ac.pos - estart);
+            }
+        } else {
+            int dup = 0;
+            for (uint32_t k = 0; k < uniq.count; k++) {
+                if (value_eq(uniq.items[k].ptr, uniq.items[k].len, vp, vl)) { dup = 1; break; }
+            }
+            if (!dup) e = val_list_push(&uniq, vp, vl);
+        }
+    }
+    if (e) { val_list_free(&uniq); free_matches(matches, match_count); return e; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { val_list_free(&uniq); free_matches(matches, match_count); return BJ_ERR_OOM; }
+    e = bj_begin_array(b);
+    for (uint32_t k = 0; !e && k < uniq.count; k++) {
+        e = bj_put_raw(b, uniq.items[k].ptr, (uint32_t)uniq.items[k].len);
+    }
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    val_list_free(&uniq);
+    free_matches(matches, match_count);
+    return e;
 }

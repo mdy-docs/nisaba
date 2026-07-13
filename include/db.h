@@ -220,6 +220,20 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
 int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len);
 
 /*
+ * Insert every document in `docs` (a binjson ARRAY; each document already
+ * _id-assigned by the caller, exactly like dc_insert_one's contract). If
+ * `ordered`, stops at the first failing document, so the result array can
+ * end up shorter than `docs`; otherwise every document is attempted
+ * regardless of earlier failures. Writes a binjson ARRAY of one INT error
+ * code per attempted document (BJ_OK on success) through *out / *out_len.
+ * insertedIds stay a client-side concern (this file's top comment) — the
+ * caller already generated each id before calling, so results only need to
+ * report success/failure per index.
+ */
+int dc_insert_many(dc_collection *c, const uint8_t *docs, uint32_t docs_len,
+                   int ordered, uint8_t **out, size_t *out_len);
+
+/*
  * First document matching `filter` (a binjson OBJECT; {} matches every
  * document). *found is 1/0; when found, writes a freshly malloc'd copy of
  * the document through *out / *out_len (caller frees). filter == {_id:
@@ -242,6 +256,21 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
  * every attached index. *deleted is 1/0. */
 int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int *deleted);
 
+/* Delete every document matching `filter`, from the primary tree and every
+ * attached index, committing the journal once per deleted document (same
+ * per-document granularity as dc_update_many). *deleted_count is the
+ * number removed. */
+int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                   int64_t *deleted_count);
+
+/*
+ * Atomically find the first document matching `filter` and delete it.
+ * *found/out/out_len follow dc_find_one's convention exactly — the
+ * deleted document's pre-image, or not-found.
+ */
+int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                           int *found, uint8_t **out, size_t *out_len);
+
 /*
  * Replace the first document matching `filter` with `replacement` (a
  * binjson OBJECT), updating every attached index to match. The stored
@@ -262,6 +291,22 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t default_id[12], int upsert, int *result);
 
 /*
+ * Atomically find the first document matching `filter` and replace it with
+ * `replacement`, exactly like dc_replace_one, but returns the document
+ * instead of a result code: the pre-image if `return_new` is 0, the
+ * post-image if 1. upsert/default_id follow dc_replace_one's convention.
+ * *found is 1 iff *out holds a meaningful document — 0 when there was no
+ * match and no upsert, OR return_new is 0 and upsert created a document
+ * (no "before" state to return, matching real MongoDB: a
+ * returnDocument:'before' findOneAndReplace with upsert:true and no match
+ * returns null).
+ */
+int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                            const uint8_t *replacement, uint32_t replacement_len,
+                            const uint8_t default_id[12], int upsert, int return_new,
+                            int *found, uint8_t **out, size_t *out_len);
+
+/*
  * Apply `update` (db_update.h: an OBJECT of $set/$unset/$inc/$push/$pull
  * operators, top-level fields only) to the first document matching
  * `filter`, updating every attached index to match. `upsert`/`default_id`
@@ -274,6 +319,18 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                   const uint8_t *update, uint32_t update_len,
                   const uint8_t default_id[12], int upsert, int *result);
+
+/*
+ * Atomically find the first document matching `filter` and apply `update`
+ * to it, exactly like dc_update_one, but returns the document instead of a
+ * result code: the pre-image if `return_new` is 0, the post-image if 1.
+ * upsert/default_id follow dc_update_one's convention. *found follows
+ * dc_find_one_and_replace's convention exactly (see its comment).
+ */
+int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                           const uint8_t *update, uint32_t update_len,
+                           const uint8_t default_id[12], int upsert, int return_new,
+                           int *found, uint8_t **out, size_t *out_len);
 
 /*
  * Like dc_update_one, but applies `update` to *every* matching document.
@@ -291,6 +348,20 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 /* Count of documents matching `filter` ({} is bpt_size of the primary tree,
  * O(1)). */
 int dc_count(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int64_t *out_count);
+
+/*
+ * Unique values of `field` (a dot-separated path — db_query.h's field-path
+ * resolution rules) across every document matching `filter`, as a binjson
+ * ARRAY. Documents missing the field contribute nothing (no synthetic
+ * null for a merely-absent field, matching real MongoDB's distinct()); an
+ * array field's elements are the candidates, not the array itself.
+ * Uniqueness is exact encoded-byte equality, the same rationale as every
+ * other equality in this codebase. Writes a freshly malloc'd buffer
+ * through *out / *out_len (caller frees).
+ */
+int dc_distinct(dc_collection *c, const char *field, int field_len,
+                const uint8_t *filter, uint32_t filter_len,
+                uint8_t **out, size_t *out_len);
 
 #ifdef __cplusplus
 }
