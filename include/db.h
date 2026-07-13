@@ -101,6 +101,9 @@ extern "C" {
 /* replaceOne's replacement document names an _id different from the
  * document `filter` matched. */
 #define DC_ERR_ID_MISMATCH (-11)
+/* A write's field values collide with another document's on a unique
+ * index (milestone 9). */
+#define DC_ERR_DUPLICATE_KEY (-12)
 
 typedef struct dc_collection dc_collection;
 
@@ -121,10 +124,21 @@ void dc_collection_free(dc_collection *c);
  * collection reopen. Use dc_collection_add_index instead to create and
  * backfill a brand-new index. BJ_ERR_STATE if `name` is already registered
  * or `fields` is empty/malformed.
+ *
+ * `unique` rejects a write whose field values collide with another
+ * document's already in the index (DC_ERR_DUPLICATE_KEY); `sparse` skips
+ * (does not index, does not error) a document missing one of `fields`,
+ * instead of the default all-or-nothing behavior; `partial_filter` (a
+ * binjson OBJECT filter, db_query.h's matcher, or NULL for "always
+ * applies") skips a document that doesn't match it. A document skipped by
+ * either option can never violate `unique` on this index (matches real
+ * MongoDB's sparse/partial + unique semantics).
  */
 int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
                                bpt *index_tree,
-                               const uint8_t *fields, uint32_t fields_len);
+                               const uint8_t *fields, uint32_t fields_len,
+                               int unique, int sparse,
+                               const uint8_t *partial_filter, uint32_t partial_filter_len);
 
 /*
  * Enable/disable the collection's cross-file commit journal and reconcile it
@@ -144,15 +158,20 @@ int dc_collection_recover(dc_collection *c, const bj_io *journal);
  * Like dc_collection_attach_index, but also backfills `index_tree` (expected
  * empty) against every document already in `c`'s primary tree before
  * attaching it for ongoing maintenance — for creating a brand-new index.
- * All-or-nothing: a document missing one of `fields`, or holding a
- * non-number/string value for one, fails the whole call (BJ_ERR_STATE) and
- * leaves `c` without the index registered (the caller should discard
- * `index_tree`'s file), matching MongoDB's own index-build failure
- * behavior for a field with disqualifying values.
+ * All-or-nothing unless `sparse`/`partial_filter` says otherwise: a
+ * document missing one of `fields` (and not skipped by `sparse`), holding
+ * a non-number/string value for one, or colliding with another document's
+ * values on a `unique` index, fails the whole call (BJ_ERR_STATE /
+ * DC_ERR_DUPLICATE_KEY) and leaves `c` without the index registered (the
+ * caller should discard `index_tree`'s file) — matching MongoDB's own
+ * index-build failure behavior, including refusing to build a `unique`
+ * index over pre-existing duplicate values.
  */
 int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
                             bpt *index_tree,
-                            const uint8_t *fields, uint32_t fields_len);
+                            const uint8_t *fields, uint32_t fields_len,
+                            int unique, int sparse,
+                            const uint8_t *partial_filter, uint32_t partial_filter_len);
 
 /*
  * Like dc_collection_attach_index, but for a single-field *text* index

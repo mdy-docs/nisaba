@@ -30,6 +30,20 @@ int qk_put_value(dbuf *out, const uint8_t *value, size_t value_len) {
         return dbuf_put(out, enc, 9);
     }
 
+    if (type == BJ_TYPE_DATE) {
+        if (value_len != 9) return BJ_ERR_STATE;
+        uint64_t bits = rdu64(value + 1); /* raw LE bytes = int64 millis-since-epoch, per bj_put_date */
+        uint8_t enc[9];
+        enc[0] = 0x03;
+        for (int i = 0; i < 8; i++) enc[1 + i] = (uint8_t)(bits >> (8 * (7 - i)));
+        /* Same signed-integer total-order transform as the number case
+         * above, applied to the raw int64 millis rather than an IEEE-754
+         * bit pattern: flipping just the sign bit converts two's-
+         * complement ordering into unsigned byte-order comparison. */
+        enc[1] ^= 0x80;
+        return dbuf_put(out, enc, 9);
+    }
+
     if (type == BJ_TYPE_STRING) {
         cur c = { value, value_len, 0 };
         const uint8_t *sp; uint32_t slen;

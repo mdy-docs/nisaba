@@ -56,15 +56,24 @@ EMSCRIPTEN_KEEPALIVE int dcw_collection_recover(dc_collection *c, int jfd) {
     return dc_collection_recover(c, &jio);
 }
 
+/* `partial_filter_len == 0` means "no partial filter" (partial_filter may
+ * then be any pointer, including NULL/0 -- dc_collection_attach_index only
+ * consults it when the length is positive). */
 EMSCRIPTEN_KEEPALIVE int dcw_collection_attach_index(dc_collection *c,
         const char *name, int name_len, bpt *index_tree,
-        const uint8_t *fields, int fields_len) {
-    return dc_collection_attach_index(c, name, name_len, index_tree, fields, (uint32_t)fields_len);
+        const uint8_t *fields, int fields_len,
+        int unique, int sparse,
+        const uint8_t *partial_filter, int partial_filter_len) {
+    return dc_collection_attach_index(c, name, name_len, index_tree, fields, (uint32_t)fields_len,
+                                      unique, sparse, partial_filter, (uint32_t)partial_filter_len);
 }
 EMSCRIPTEN_KEEPALIVE int dcw_collection_add_index(dc_collection *c,
         const char *name, int name_len, bpt *index_tree,
-        const uint8_t *fields, int fields_len) {
-    return dc_collection_add_index(c, name, name_len, index_tree, fields, (uint32_t)fields_len);
+        const uint8_t *fields, int fields_len,
+        int unique, int sparse,
+        const uint8_t *partial_filter, int partial_filter_len) {
+    return dc_collection_add_index(c, name, name_len, index_tree, fields, (uint32_t)fields_len,
+                                   unique, sparse, partial_filter, (uint32_t)partial_filter_len);
 }
 EMSCRIPTEN_KEEPALIVE int dcw_collection_attach_text_index(dc_collection *c,
         const char *name, int name_len,

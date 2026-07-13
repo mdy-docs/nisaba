@@ -113,6 +113,18 @@ static int value_cmp(const uint8_t *a, size_t alen, const uint8_t *b, size_t ble
         if (la > lb) return 1;
         return 0;
     }
+    /* Date-vs-Date only (a Date is 1 type byte + 8-byte LE millis-since-
+     * epoch, c/binjson.c's bj_put_date) -- scoped narrowly as a milestone-9
+     * TTL prerequisite ($lt/$gt against expireAfterSeconds cutoffs), not
+     * the broader cross-BSON-type ordering db_query.h documents as
+     * out of scope. */
+    if (ta == BJ_TYPE_DATE && tb == BJ_TYPE_DATE) {
+        if (alen != 9 || blen != 9) return -2;
+        int64_t da = (int64_t)rdu64(a + 1), db = (int64_t)rdu64(b + 1);
+        if (da < db) return -1;
+        if (da > db) return 1;
+        return 0;
+    }
     return -2;
 }
 

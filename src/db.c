@@ -33,6 +33,10 @@ typedef struct {
     uint8_t **field_names;      /* owned copies, one per composite-key part */
     uint32_t *field_name_lens;
     uint32_t field_count;
+    int unique;                 /* reject a write whose field values collide with another document's */
+    int sparse;                 /* skip (don't error) documents missing a field, rather than index them */
+    uint8_t *partial_filter;    /* owned copy, binjson OBJECT, or NULL for "always applies" */
+    uint32_t partial_filter_len;
 
     /* DC_IDX_TEXT */
     bpt *tix_index, *tix_doc_terms, *tix_doc_lengths; /* not owned */
@@ -59,6 +63,7 @@ static void free_index(dc_index *ix) {
     for (uint32_t i = 0; i < ix->field_count; i++) free(ix->field_names[i]);
     free(ix->field_names);
     free(ix->field_name_lens);
+    free(ix->partial_filter);
     free(ix->text_field);
     free(ix->geo_field);
     memset(ix, 0, sizeof(*ix));
@@ -319,7 +324,9 @@ static int backfill_index(dc_collection *c, const char *name, int name_len) {
 
 int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
                                bpt *index_tree,
-                               const uint8_t *fields, uint32_t fields_len) {
+                               const uint8_t *fields, uint32_t fields_len,
+                               int unique, int sparse,
+                               const uint8_t *partial_filter, uint32_t partial_filter_len) {
     if (find_index(c, name, name_len)) return BJ_ERR_STATE;
 
     cur fc = { fields, fields_len, 0 };
@@ -336,6 +343,14 @@ int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
     memcpy(ix.name, name, (size_t)name_len);
     ix.name_len = (uint32_t)name_len;
     ix.tree = index_tree;
+    ix.unique = unique;
+    ix.sparse = sparse;
+    if (partial_filter && partial_filter_len > 0) {
+        ix.partial_filter = (uint8_t *)malloc(partial_filter_len);
+        if (!ix.partial_filter) { free_index(&ix); return BJ_ERR_OOM; }
+        memcpy(ix.partial_filter, partial_filter, partial_filter_len);
+        ix.partial_filter_len = partial_filter_len;
+    }
     ix.field_names = (uint8_t **)calloc(fcount, sizeof(uint8_t *));
     ix.field_name_lens = (uint32_t *)calloc(fcount, sizeof(uint32_t));
     if (!ix.field_names || !ix.field_name_lens) { free_index(&ix); return BJ_ERR_OOM; }
@@ -585,11 +600,12 @@ static int parse_geojson_point(const uint8_t *val, size_t val_len, double *lat, 
 
 /* ---- index maintenance --------------------------------------------------- */
 
-/* Build one composite-key equality index's key for `doc`/`id` (its ordered
- * field values followed by the id-suffix tag + `id`) into `out`, an
- * ordinary dbuf the caller zero-inits and frees. */
-static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_len,
-                           const uint8_t id[12], dbuf *out) {
+/* Build one composite-key equality index's value-only prefix (its ordered
+ * field values, no id suffix) for `doc` into `out`, an ordinary dbuf the
+ * caller zero-inits and frees. Shared by build_index_key (below) and
+ * check_unique_one, which both need the same value encoding without
+ * committing to (or excluding) any particular id suffix. */
+static int build_index_key_prefix(const dc_index *ix, const uint8_t *doc, size_t doc_len, dbuf *out) {
     for (uint32_t i = 0; i < ix->field_count; i++) {
         const uint8_t *vp; size_t vlen; int found;
         int e = obj_get_field(doc, doc_len, ix->field_names[i], ix->field_name_lens[i], &vp, &vlen, &found);
@@ -598,13 +614,123 @@ static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_le
         e = qk_put_value(out, vp, vlen);
         if (e) return e;
     }
+    return BJ_OK;
+}
+
+/* Build one composite-key equality index's key for `doc`/`id` (its ordered
+ * field values followed by the id-suffix tag + `id`) into `out`, an
+ * ordinary dbuf the caller zero-inits and frees. */
+static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_len,
+                           const uint8_t id[12], dbuf *out) {
+    int e = build_index_key_prefix(ix, doc, doc_len, out);
+    if (e) return e;
     return qk_put_id(out, id);
+}
+
+/* Whether `doc` should have an entry in equality index `ix`, per its
+ * sparse/partialFilterExpression options. Does NOT gate on a missing field
+ * for a non-sparse index -- that stays build_index_key's existing
+ * all-or-nothing BJ_ERR_STATE, unchanged. */
+static int equality_index_applies(const dc_index *ix, const uint8_t *doc, size_t doc_len, int *applies) {
+    *applies = 1;
+    if (ix->partial_filter) {
+        int m = 0;
+        int e = qry_matches(doc, doc_len, ix->partial_filter, ix->partial_filter_len, &m);
+        if (e) return e;
+        if (!m) { *applies = 0; return BJ_OK; }
+    }
+    if (ix->sparse) {
+        for (uint32_t i = 0; i < ix->field_count; i++) {
+            const uint8_t *vp; size_t vl; int found;
+            int e = obj_get_field(doc, doc_len, ix->field_names[i], ix->field_name_lens[i], &vp, &vl, &found);
+            if (e) return e;
+            if (!found) { *applies = 0; return BJ_OK; }
+        }
+    }
+    return BJ_OK;
+}
+
+/*
+ * Whether `doc`'s field values already have an entry in unique index `ix`
+ * belonging to some other document. Range-scans [prefix, prefix+upper
+ * bound) on ix->tree -- the same bound-building dc_collection_find_by_index
+ * already does via db_keyenc.h -- for any entry at all. No self-id
+ * exclusion is needed: by the time add_to_one_index runs for a document's
+ * *new* state, its own *old* entry has already been removed
+ * (dc_update_one/dc_replace_one/dc_update_many all call
+ * remove_from_indexes before add_to_indexes), so any entry found here
+ * already belongs to a different document.
+ */
+static int check_unique_one(const dc_index *ix, const uint8_t *doc, size_t doc_len, int *conflict) {
+    *conflict = 0;
+    dbuf prefix; memset(&prefix, 0, sizeof(prefix));
+    int e = build_index_key_prefix(ix, doc, doc_len, &prefix);
+    if (e) { dbuf_free(&prefix); return e; }
+
+    dbuf upper; memset(&upper, 0, sizeof(upper));
+    e = dbuf_put(&upper, prefix.data, prefix.len);
+    if (!e) e = qk_put_upper_bound(&upper);
+    if (e) { dbuf_free(&prefix); dbuf_free(&upper); return e; }
+
+    bpt_key min_key; min_key.is_string = 1; min_key.num = 0;
+    min_key.str = prefix.data; min_key.str_len = (uint32_t)prefix.len;
+    bpt_key max_key; max_key.is_string = 1; max_key.num = 0;
+    max_key.str = upper.data; max_key.str_len = (uint32_t)upper.len;
+
+    bpt_cursor *cur_h = bpt_cursor_open(ix->tree, &min_key, &max_key);
+    if (!cur_h) { dbuf_free(&prefix); dbuf_free(&upper); return BJ_ERR_OOM; }
+    bpt_key k; const uint8_t *val; size_t vlen;
+    int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+    if (r < 0) e = r;
+    else if (r > 0) *conflict = 1;
+    bpt_cursor_close(cur_h);
+    dbuf_free(&prefix);
+    dbuf_free(&upper);
+    return e;
+}
+
+/*
+ * Reject `doc` up front if it would collide with another document on any
+ * attached unique equality index. Called before any primary-tree/index
+ * mutation for a write (dc_insert_one; dc_replace_one/dc_update_one/
+ * dc_update_many right after remove_from_indexes, before the primary
+ * bpt_add) so a rejection never leaves a forbidden duplicate value sitting
+ * in the primary tree -- add_to_one_index's own unique check (needed for
+ * backfill, which doesn't go through these entry points) runs too late for
+ * that: after the primary tree already holds the new document.
+ */
+static int check_unique_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len) {
+    for (uint32_t i = 0; i < c->index_count; i++) {
+        dc_index *ix = &c->indexes[i];
+        if (ix->kind != DC_IDX_EQUALITY || !ix->unique) continue;
+        int applies = 1;
+        int e = equality_index_applies(ix, doc, doc_len, &applies);
+        if (e) return e;
+        if (!applies) continue;
+        int conflict = 0;
+        e = check_unique_one(ix, doc, doc_len, &conflict);
+        if (e) return e;
+        if (conflict) return DC_ERR_DUPLICATE_KEY;
+    }
+    return BJ_OK;
 }
 
 static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
     if (ix->kind == DC_IDX_EQUALITY) {
+        int applies = 1;
+        int e = equality_index_applies(ix, doc, doc_len, &applies);
+        if (e) return e;
+        if (!applies) return BJ_OK; /* sparse/partialFilterExpression: not indexed */
+
+        if (ix->unique) {
+            int conflict = 0;
+            e = check_unique_one(ix, doc, doc_len, &conflict);
+            if (e) return e;
+            if (conflict) return DC_ERR_DUPLICATE_KEY;
+        }
+
         dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
-        int e = build_index_key(ix, doc, doc_len, id, &key_bytes);
+        e = build_index_key(ix, doc, doc_len, id, &key_bytes);
         if (e) { dbuf_free(&key_bytes); return e; }
         bpt_key key; key.is_string = 1; key.num = 0;
         key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
@@ -649,8 +775,13 @@ static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, co
 
 static int remove_from_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
     if (ix->kind == DC_IDX_EQUALITY) {
+        int applies = 1;
+        int e = equality_index_applies(ix, doc, doc_len, &applies);
+        if (e) return e;
+        if (!applies) return BJ_OK; /* sparse/partialFilterExpression: was never indexed */
+
         dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
-        int e = build_index_key(ix, doc, doc_len, id, &key_bytes);
+        e = build_index_key(ix, doc, doc_len, id, &key_bytes);
         if (e) { dbuf_free(&key_bytes); return e; }
         bpt_key key; key.is_string = 1; key.num = 0;
         key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
@@ -702,8 +833,11 @@ static int remove_from_indexes(dc_collection *c, const uint8_t *doc, size_t doc_
 
 int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
                             bpt *index_tree,
-                            const uint8_t *fields, uint32_t fields_len) {
-    int e = dc_collection_attach_index(c, name, name_len, index_tree, fields, fields_len);
+                            const uint8_t *fields, uint32_t fields_len,
+                            int unique, int sparse,
+                            const uint8_t *partial_filter, uint32_t partial_filter_len) {
+    int e = dc_collection_attach_index(c, name, name_len, index_tree, fields, fields_len,
+                                       unique, sparse, partial_filter, partial_filter_len);
     if (e) return e;
     e = backfill_index(c, name, name_len);
     if (e) return e; /* backfill_index already unregistered ix on failure */
@@ -1380,6 +1514,8 @@ int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
     e = bpt_search(c->primary, &key, &found, &p, &n);
     if (e) return e;
     if (found) return DC_ERR_DUPLICATE;
+    e = check_unique_indexes(c, doc, doc_len);
+    if (e) return e;
     e = bpt_add(c->primary, &key, doc, doc_len);
     if (e) return e;
     e = add_to_indexes(c, doc, doc_len, id);
@@ -1685,6 +1821,12 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     free(doc);
     if (e) { free(spliced); return e; }
 
+    /* Checked here, after the old entries are cleared (so nothing self-
+     * conflicts) but before the primary tree sees the new content -- a
+     * rejection must never leave a forbidden duplicate value in primary. */
+    e = check_unique_indexes(c, spliced, spliced_len);
+    if (e) { free(spliced); return e; }
+
     bpt_key key; oid_key(existing_id, &key);
     e = bpt_add(c->primary, &key, spliced, (uint32_t)spliced_len);
     if (!e) e = add_to_indexes(c, spliced, (uint32_t)spliced_len, existing_id);
@@ -1821,6 +1963,9 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     free(doc);
     if (e) { free(updated); return e; }
 
+    e = check_unique_indexes(c, updated, updated_len);
+    if (e) { free(updated); return e; }
+
     bpt_key key; oid_key(id, &key);
     e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
     if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
@@ -1913,6 +2058,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, &updated, &updated_len);
             if (e) { free(updated); break; }
             e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
+            if (!e) e = check_unique_indexes(c, updated, updated_len);
             if (!e) {
                 bpt_key key; oid_key(id, &key);
                 e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);

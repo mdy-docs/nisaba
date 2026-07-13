@@ -7,11 +7,13 @@
  * string and scans a contiguous range for a given value.
  *
  * Only binjson INT/FLOAT (one "number" domain, matching how JS treats every
- * number uniformly) and STRING values have an order-preserving encoding
- * here — the same scope as the JS primitive being ported. Any other type
- * (including a document missing the field) is BJ_ERR_STATE; extending the
- * domain (OID, Date, a full BSON-like total order across types, sparse
- * indexes for missing fields) is future work, not this port.
+ * number uniformly), STRING, and (milestone 9, for TTL indexes) DATE values
+ * have an order-preserving encoding here — the same scope as the JS
+ * primitive being ported, plus DATE. Any other type (including a document
+ * missing the field) is BJ_ERR_STATE; extending the domain further (OID, a
+ * full BSON-like total order across types, sparse indexes for missing
+ * fields — the latter now handled a level up, in db.c's
+ * equality_index_applies) is future work, not this port.
  *
  * Wire shape of one encoded key, built by calling qk_put_value once per
  * indexed field (in index order) followed by exactly one qk_put_id:
@@ -19,6 +21,9 @@
  *   - string: 0x01 tag + UTF-8 bytes + a 0x00 terminator (so a string part
  *     must not itself contain U+0000)
  *   - id suffix: 0x02 tag + the 12 raw ObjectId bytes verbatim
+ *   - date: 0x03 tag + 8-byte sign-normalized big-endian int64 millis-
+ *     since-epoch (the same sign-bit-flip transform as number, applied to
+ *     a plain signed integer instead of an IEEE-754 bit pattern)
  * Every part's tag byte is < 0xff and every part is self-delimiting, so
  * parts concatenate unambiguously and qk_put_upper_bound's single 0xff
  * sentinel is guaranteed to sort after every real key sharing the same
