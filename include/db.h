@@ -5,7 +5,7 @@
  * A collection is a `dc_collection`: one primary bpt (documents keyed by the
  * raw 12-byte ObjectId, an opaque byte-string key) plus zero or more
  * attached secondary indexes, each its own bpt keyed by a composite of
- * ordered field values + an id suffix (keyenc.h), per the convention
+ * ordered field values + an id suffix (db_keyenc.h), per the convention
  * documented in bplustree.h. `dc_collection` only *coordinates* already-open
  * bpt handles — every bpt (primary and each index) is opened/closed by the
  * host (JS), exactly as milestone 1's plain `bpt*` was.
@@ -17,11 +17,11 @@
  * the storage engine inventing it, and keeps randomness/clock access (which
  * WASM has no portable source for) out of C entirely.
  *
- * Filters are matched by query.h's operator-aware evaluator ($eq/$ne/$gt/
+ * Filters are matched by db_query.h's operator-aware evaluator ($eq/$ne/$gt/
  * $gte/$lt/$lte/$in/$nin/$exists/$not/$and/$or/$nor, dotted field paths,
- * implicit array-element matching — see query.h for the exact rules and
+ * implicit array-element matching — see db_query.h for the exact rules and
  * deliberate omissions). dc_find additionally applies sort/skip/limit/
- * projection (query.h again) to the matched set.
+ * projection (db_query.h again) to the matched set.
  *
  * dc_find/dc_find_one/dc_count/dc_update_one/dc_update_many use an attached
  * index instead of a full collection scan when `filter`'s top level is a
@@ -33,9 +33,9 @@
  * gathers, so correctness never depends on which plan was chosen — only
  * speed does.
  *
- * dc_update_one/dc_update_many apply update.h's $set/$unset/$inc/$push/
+ * dc_update_one/dc_update_many apply db_update.h's $set/$unset/$inc/$push/
  * $pull operators (top-level fields only) instead of replacing the whole
- * document — see update.h for the exact rules and deliberate omissions.
+ * document — see db_update.h for the exact rules and deliberate omissions.
  *
  * Besides the composite-key equality index from milestone 2, a collection
  * may attach a *text* index (single field, backed by a TextIndex's three
@@ -55,7 +55,7 @@
  * km-based API; $near and $geoWithin both require an attached geo index on
  * the named field (BJ_ERR_STATE otherwise) — real MongoDB only requires
  * one for $near, but requiring it for $geoWithin too avoids duplicating
- * point-in-shape math in query.c for what is, in practice, an uncommon
+ * point-in-shape math in db_query.c for what is, in practice, an uncommon
  * unindexed-geo-scan use case.
  *
  * Known gap (see docs/db-plan.md milestone 5): index maintenance is not
@@ -77,8 +77,8 @@
 #include "bplustree.h"
 #include "rtree.h"
 #include "textindex.h"
-#include "query.h"
-#include "update.h"
+#include "db_query.h"
+#include "db_update.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -206,7 +206,7 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 /*
  * Every document matching `filter`, as a binjson ARRAY of documents (not
  * {key,value} pairs), with `opts` (may be NULL for none) applied — see
- * query.h for sort/skip/limit/projection semantics. Writes a freshly
+ * db_query.h for sort/skip/limit/projection semantics. Writes a freshly
  * malloc'd buffer through *out / *out_len (caller frees).
  */
 int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
@@ -236,7 +236,7 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t default_id[12], int upsert, int *result);
 
 /*
- * Apply `update` (update.h: an OBJECT of $set/$unset/$inc/$push/$pull
+ * Apply `update` (db_update.h: an OBJECT of $set/$unset/$inc/$push/$pull
  * operators, top-level fields only) to the first document matching
  * `filter`, updating every attached index to match. `upsert`/`default_id`
  * and *result follow dc_replace_one's convention exactly (0/1/2), except

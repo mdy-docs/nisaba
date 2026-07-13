@@ -6,12 +6,12 @@
  * host tree the way binjson.h's visitor-based bj_decode does — field lookup
  * and filter matching only ever need "where does this field's value start
  * and end", which skip_value gives directly. Composite index keys are built
- * with keyenc.h.
+ * with db_keyenc.h.
  */
 #include "db.h"
-#include "keyenc.h"
-#include "query.h"
-#include "update.h"
+#include "db_keyenc.h"
+#include "db_query.h"
+#include "db_update.h"
 #include "bjcursor.h"
 #include "dbuf.h"
 
@@ -915,7 +915,7 @@ static void dc_source_free(dc_source *src) {
  * most one clause is recognized (MongoDB itself doesn't allow combining
  * $text with $near), and only at the filter's top level -- one nested
  * under $and/$or/$nor is not detected (falls through to a full scan, where
- * query.c's evaluator will reject $near/$geoWithin as unrecognized
+ * db_query.c's evaluator will reject $near/$geoWithin as unrecognized
  * operators rather than silently ignoring them).
  */
 static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_t filter_len, dc_source *src) {

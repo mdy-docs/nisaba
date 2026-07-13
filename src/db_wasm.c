@@ -106,7 +106,7 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one(dcw_out *o, dc_collection *c,
 
 /* `sort`/`projection` may be NULL (with length 0) for "none"; skip/limit
  * cross the bridge as doubles (like every other count/size value here) and
- * 0 means "no skip" / "no limit" -- see query.h. */
+ * 0 means "no skip" / "no limit" -- see db_query.h. */
 EMSCRIPTEN_KEEPALIVE int dcw_find(dcw_out *o, dc_collection *c,
                                   const uint8_t *filter, int filter_len,
                                   const uint8_t *sort, int sort_len,
