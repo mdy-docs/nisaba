@@ -11,6 +11,7 @@
 #include "db.h"
 #include "keyenc.h"
 #include "query.h"
+#include "update.h"
 #include "bjcursor.h"
 #include "dbuf.h"
 
@@ -693,6 +694,192 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     if (e) return e;
     *result = 1;
     return BJ_OK;
+}
+
+/*
+ * A base document for an upsert: `filter`'s top-level bare-literal
+ * conditions (fields not wrapped in an operator expression). Fields under
+ * $and/$or/$nor, or given as an operator expression ({$gt: 5}), are
+ * skipped -- matching how MongoDB seeds an upsert from a query's equality
+ * conditions, conservatively scoped like the equality-index planner
+ * (plan_equality_index) just above it in spirit.
+ */
+static int build_upsert_seed(const uint8_t *filter, size_t filter_len, uint8_t **out, size_t *out_len) {
+    cur c = { filter, filter_len, 0 };
+    uint32_t count;
+    int e = object_begin(&c, &count);
+    if (e) return e;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    e = bj_begin_object(b);
+    for (uint32_t i = 0; !e && i < count; i++) {
+        const uint8_t *kp; uint32_t klen;
+        e = take_key(&c, &kp, &klen);
+        if (e) break;
+        size_t vstart = c.pos;
+        e = skip_value(&c);
+        if (e) break;
+        if (klen > 0 && kp[0] == '$') continue;
+        int is_expr = 0;
+        e = qry_is_operator_expr(c.d + vstart, c.pos - vstart, &is_expr);
+        if (e) break;
+        if (is_expr) continue;
+        e = bj_put_key(b, kp, klen);
+        if (!e) e = bj_put_raw(b, c.d + vstart, (uint32_t)(c.pos - vstart));
+    }
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                  const uint8_t *update, uint32_t update_len,
+                  const uint8_t default_id[12], int upsert, int *result) {
+    *result = 0;
+
+    int e = upd_validate(update, update_len);
+    if (e) return e;
+
+    int found = 0; uint8_t *doc = NULL; size_t doc_len = 0;
+    e = dc_find_one(c, filter, filter_len, &found, &doc, &doc_len);
+    if (e) { free(doc); return e; }
+
+    if (!found) {
+        free(doc);
+        if (!upsert) return BJ_OK;
+        uint8_t *seed = NULL; size_t seed_len = 0;
+        e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
+        uint8_t *updated = NULL; size_t updated_len = 0;
+        if (!e) e = upd_apply(seed, seed_len, update, update_len, &updated, &updated_len);
+        free(seed);
+        if (e) { free(updated); return e; }
+        uint8_t *spliced = NULL; size_t spliced_len = 0;
+        e = splice_id(updated, updated_len, default_id, &spliced, &spliced_len);
+        free(updated);
+        if (e) return e;
+        e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
+        free(spliced);
+        if (e) return e;
+        *result = 2;
+        return BJ_OK;
+    }
+
+    uint8_t id[12];
+    e = dc_get_id(doc, (uint32_t)doc_len, id);
+    if (e) { free(doc); return e; }
+
+    uint8_t *updated = NULL; size_t updated_len = 0;
+    e = upd_apply(doc, doc_len, update, update_len, &updated, &updated_len);
+    if (e) { free(doc); free(updated); return e; }
+
+    e = remove_from_indexes(c, doc, doc_len, id);
+    free(doc);
+    if (e) { free(updated); return e; }
+
+    bpt_key key; oid_key(id, &key);
+    e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
+    if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
+    free(updated);
+    if (e) return e;
+    *result = 1;
+    return BJ_OK;
+}
+
+int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                   const uint8_t *update, uint32_t update_len,
+                   const uint8_t default_id[12], int upsert,
+                   int64_t *matched_count, int *upserted) {
+    *matched_count = 0; *upserted = 0;
+
+    int e = upd_validate(update, update_len);
+    if (e) return e;
+
+    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+    int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    if (e) return e;
+
+    qry_doc *matches = NULL;
+    size_t match_count = 0, match_cap = 0;
+
+    if (planned) {
+        uint8_t *cand = NULL; size_t cand_len = 0;
+        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+        free(ix_values);
+        if (e) { free(cand); return e; }
+        cur cc = { cand, cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
+            if (e) break;
+        }
+        free(cand);
+    } else {
+        free(ix_values);
+        bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
+        if (!cur_h) e = BJ_ERR_OOM;
+        while (!e && cur_h) {
+            bpt_key k; const uint8_t *val; size_t vlen;
+            int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+            if (r < 0) { e = r; break; }
+            if (r == 0) break;
+            int m = 0;
+            e = qry_matches(val, vlen, filter, filter_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
+        }
+        if (cur_h) bpt_cursor_close(cur_h);
+    }
+
+    if (!e && match_count == 0) {
+        if (upsert) {
+            uint8_t *seed = NULL; size_t seed_len = 0;
+            e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
+            uint8_t *updated = NULL; size_t updated_len = 0;
+            if (!e) e = upd_apply(seed, seed_len, update, update_len, &updated, &updated_len);
+            free(seed);
+            uint8_t *spliced = NULL; size_t spliced_len = 0;
+            if (!e) e = splice_id(updated, updated_len, default_id, &spliced, &spliced_len);
+            free(updated);
+            if (!e) e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
+            free(spliced);
+            if (!e) *upserted = 1;
+        }
+    } else if (!e) {
+        *matched_count = (int64_t)match_count;
+        for (size_t i = 0; !e && i < match_count; i++) {
+            uint8_t id[12];
+            e = dc_get_id(matches[i].ptr, (uint32_t)matches[i].len, id);
+            if (e) break;
+            uint8_t *updated = NULL; size_t updated_len = 0;
+            e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, &updated, &updated_len);
+            if (e) { free(updated); break; }
+            e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
+            if (!e) {
+                bpt_key key; oid_key(id, &key);
+                e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
+            }
+            if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
+            free(updated);
+        }
+    }
+
+    free_matches(matches, match_count);
+    return e;
 }
 
 int dc_count(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int64_t *out_count) {

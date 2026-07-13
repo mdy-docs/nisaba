@@ -15,6 +15,7 @@
  * HEAPU8 after any call before touching a returned pointer.
  */
 #include "db.h"
+#include "dbuf.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -118,6 +119,51 @@ EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dc_collection *c,
                            default_id, upsert, &result);
     if (e) return e;
     return result;
+}
+
+/* Returns 0 (no match, no upsert), 1 (matched and updated), 2 (upserted),
+ * or a negative error. */
+EMSCRIPTEN_KEEPALIVE int dcw_update_one(dc_collection *c,
+        const uint8_t *filter, int filter_len,
+        const uint8_t *update, int update_len,
+        const uint8_t *default_id, int upsert) {
+    int result = 0;
+    int e = dc_update_one(c, filter, (uint32_t)filter_len,
+                          update, (uint32_t)update_len,
+                          default_id, upsert, &result);
+    if (e) return e;
+    return result;
+}
+
+/* Writes a binjson OBJECT { matchedCount: number, upserted: bool } into the
+ * out slot; matchedCount is 0 whenever upserted is true. Returns 0 on
+ * success, negative on error. */
+EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
+        const uint8_t *filter, int filter_len,
+        const uint8_t *update, int update_len,
+        const uint8_t *default_id, int upsert) {
+    reset_out(o);
+    int64_t matched = 0; int upserted = 0;
+    int e = dc_update_many(c, filter, (uint32_t)filter_len,
+                           update, (uint32_t)update_len,
+                           default_id, upsert, &matched, &upserted);
+    if (e) return e;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"matchedCount", 12);
+    if (!e) e = bj_put_int(b, matched);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"upserted", 8);
+    if (!e) e = bj_put_bool(b, upserted);
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, &o->buf, &o->len);
+    }
+    bj_builder_free(b);
+    return e;
 }
 
 EMSCRIPTEN_KEEPALIVE double dcw_count(dc_collection *c, const uint8_t *filter, int filter_len) {
