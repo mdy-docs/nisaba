@@ -10,7 +10,9 @@
  */
 #include "db.h"
 #include "keyenc.h"
+#include "query.h"
 #include "bjcursor.h"
+#include "dbuf.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -131,43 +133,6 @@ static void oid_key(const uint8_t id[12], bpt_key *k) {
     k->str_len = 12;
 }
 
-static int dup_bytes(const uint8_t *p, size_t n, uint8_t **out, size_t *out_len) {
-    uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
-    if (!buf) return BJ_ERR_OOM;
-    if (n) memcpy(buf, p, n);
-    *out = buf;
-    *out_len = n;
-    return BJ_OK;
-}
-
-/* Look up `name` at the top level of binjson OBJECT `obj`. On success,
- * *found = 1 and val_ptr/val_len span exactly the field's encoded value
- * (type byte included), pointing into `obj`; *found = 0 if no such field. */
-static int obj_get_field(const uint8_t *obj, size_t obj_len,
-                          const uint8_t *name, uint32_t name_len,
-                          const uint8_t **val_ptr, size_t *val_len, int *found) {
-    cur c = { obj, obj_len, 0 };
-    uint32_t count;
-    int e = object_begin(&c, &count);
-    if (e) return e;
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *kp; uint32_t klen;
-        e = take_key(&c, &kp, &klen);
-        if (e) return e;
-        size_t vstart = c.pos;
-        e = skip_value(&c);
-        if (e) return e;
-        if (klen == name_len && memcmp(kp, name, name_len) == 0) {
-            *val_ptr = c.d + vstart;
-            *val_len = c.pos - vstart;
-            *found = 1;
-            return BJ_OK;
-        }
-    }
-    *found = 0;
-    return BJ_OK;
-}
-
 /* `doc`'s top-level _id, which must be an OID (13 encoded bytes: type + 12
  * raw). BJ_ERR_STATE if absent or any other type. */
 static int dc_get_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]) {
@@ -176,36 +141,6 @@ static int dc_get_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]) {
     if (e) return e;
     if (!found || vlen != 13 || vp[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
     memcpy(id_out, vp + 1, 12);
-    return BJ_OK;
-}
-
-/* True (via *out_matches) iff every field in `filter` has an identically-
- * encoded counterpart in `doc` — see db.h for why byte equality is the
- * right notion of "equal" here. */
-static int dc_matches(const uint8_t *doc, size_t doc_len,
-                      const uint8_t *filter, size_t filter_len, int *out_matches) {
-    cur c = { filter, filter_len, 0 };
-    uint32_t count;
-    int e = object_begin(&c, &count);
-    if (e) return e;
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *kp; uint32_t klen;
-        e = take_key(&c, &kp, &klen);
-        if (e) return e;
-        size_t vstart = c.pos;
-        e = skip_value(&c);
-        if (e) return e;
-        size_t vlen = c.pos - vstart;
-
-        const uint8_t *dval; size_t dlen; int found;
-        e = obj_get_field(doc, doc_len, kp, klen, &dval, &dlen, &found);
-        if (e) return e;
-        if (!found || dlen != vlen || memcmp(dval, c.d + vstart, vlen) != 0) {
-            *out_matches = 0;
-            return BJ_OK;
-        }
-    }
-    *out_matches = 1;
     return BJ_OK;
 }
 
@@ -377,10 +312,123 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
     if (!e) {
         size_t n; const uint8_t *p = bj_builder_data(b, &n);
         if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
-        else e = dup_bytes(p, n, out, out_len);
+        else e = dbuf_dup(p, n, out, out_len);
     }
     bj_builder_free(b);
     return e;
+}
+
+/* ---- equality-index planner ------------------------------------------------ */
+
+/* If `cond` (a field's filter value) is a bare literal or {$eq: v}, writes
+ * v's span through *val / *val_len and returns 1; 0 otherwise (any other
+ * operator expression -- not an error, just "can't use this for planning",
+ * the caller falls back to a full scan). */
+static int cond_as_eq(const uint8_t *cond, size_t cond_len, const uint8_t **val, size_t *val_len) {
+    int is_expr = 0;
+    if (qry_is_operator_expr(cond, cond_len, &is_expr)) return 0;
+    if (!is_expr) { *val = cond; *val_len = cond_len; return 1; }
+    cur c = { cond, cond_len, 0 };
+    uint32_t count;
+    if (object_begin(&c, &count)) return 0;
+    if (count != 1) return 0;
+    const uint8_t *kp; uint32_t klen;
+    if (take_key(&c, &kp, &klen)) return 0;
+    size_t vstart = c.pos;
+    if (skip_value(&c)) return 0;
+    if (!(klen == 3 && memcmp(kp, "$eq", 3) == 0)) return 0;
+    *val = c.d + vstart; *val_len = c.pos - vstart;
+    return 1;
+}
+
+/*
+ * If `filter`'s top level is a pure AND of {field: literal} / {field:
+ * {$eq: v}} conditions that together pin every field of some attached
+ * index (in that index's field order), builds the binjson ARRAY of those
+ * values (index field order) into *values_out (caller frees) and returns
+ * the index via *ix_out, with *applicable = 1. *applicable = 0 (not an
+ * error) whenever no such index applies -- every caller re-applies the
+ * full filter to whatever candidate set it gathers, so the result is
+ * correct either way; this only chooses how candidates are gathered.
+ * Deliberately conservative for this milestone: bails out of planning
+ * entirely the moment the filter's top level has any $-prefixed key
+ * ($and/$or/$nor), rather than looking inside them, and only ever performs
+ * an equality lookup (no partial-prefix + range index usage yet).
+ */
+static int plan_equality_index(dc_collection *c, const uint8_t *filter, size_t filter_len,
+                               dc_index **ix_out, uint8_t **values_out, size_t *values_out_len,
+                               int *applicable) {
+    *applicable = 0;
+    cur fc = { filter, filter_len, 0 };
+    uint32_t fcount;
+    int e = object_begin(&fc, &fcount);
+    if (e) return e;
+    for (uint32_t i = 0; i < fcount; i++) {
+        const uint8_t *kp; uint32_t klen;
+        e = take_key(&fc, &kp, &klen);
+        if (e) return e;
+        e = skip_value(&fc);
+        if (e) return e;
+        if (klen > 0 && kp[0] == '$') return BJ_OK;
+    }
+
+    for (uint32_t ixi = 0; ixi < c->index_count; ixi++) {
+        dc_index *ix = &c->indexes[ixi];
+        bj_builder *b = bj_builder_new();
+        if (!b) return BJ_ERR_OOM;
+        e = bj_begin_array(b);
+        int ok = 1;
+        for (uint32_t fi = 0; ok && !e && fi < ix->field_count; fi++) {
+            const uint8_t *cond; size_t cond_len; int found;
+            e = obj_get_field(filter, filter_len, ix->field_names[fi], ix->field_name_lens[fi], &cond, &cond_len, &found);
+            if (e) break;
+            if (!found) { ok = 0; break; }
+            const uint8_t *val; size_t val_len;
+            if (!cond_as_eq(cond, cond_len, &val, &val_len)) { ok = 0; break; }
+            e = bj_put_raw(b, val, (uint32_t)val_len);
+        }
+        if (!e && ok) e = bj_end_array(b);
+        if (!e && ok) {
+            size_t n; const uint8_t *p = bj_builder_data(b, &n);
+            if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+            if (!e) {
+                e = dbuf_dup(p, n, values_out, values_out_len);
+                if (!e) {
+                    bj_builder_free(b);
+                    *ix_out = ix;
+                    *applicable = 1;
+                    return BJ_OK;
+                }
+            }
+        }
+        bj_builder_free(b);
+        if (e) return e;
+        /* not ok for this index: try the next one */
+    }
+    return BJ_OK;
+}
+
+/* Growable list of matched documents, each an independently owned copy
+ * (dbuf_dup) so it survives past the scan/cursor that produced it. */
+static int push_match(qry_doc **matches, size_t *count, size_t *cap, const uint8_t *p, size_t n) {
+    if (*count == *cap) {
+        size_t ncap = *cap ? *cap * 2 : 8;
+        qry_doc *nb = (qry_doc *)realloc(*matches, ncap * sizeof(qry_doc));
+        if (!nb) return BJ_ERR_OOM;
+        *matches = nb; *cap = ncap;
+    }
+    uint8_t *dp = NULL; size_t dl = 0;
+    int e = dbuf_dup(p, n, &dp, &dl);
+    if (e) return e;
+    (*matches)[*count].ptr = dp;
+    (*matches)[*count].len = dl;
+    (*count)++;
+    return BJ_OK;
+}
+
+static void free_matches(qry_doc *matches, size_t count) {
+    for (size_t i = 0; i < count; i++) free((void *)matches[i].ptr);
+    free(matches);
 }
 
 /* ---- CRUD ---------------------------------------------------------------- */
@@ -414,8 +462,41 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         e = bpt_search(c->primary, &key, &f, &p, &n);
         if (e || !f) return e;
         *found = 1;
-        return dup_bytes(p, n, out, out_len);
+        return dbuf_dup(p, n, out, out_len);
     }
+
+    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+    int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    if (e) return e;
+
+    if (planned) {
+        uint8_t *cand = NULL; size_t cand_len = 0;
+        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+        free(ix_values);
+        if (e) { free(cand); return e; }
+
+        cur cc = { cand, cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+            if (e) break;
+            if (m) {
+                *found = 1;
+                e = dbuf_dup(cc.d + dstart, cc.pos - dstart, out, out_len);
+                break;
+            }
+        }
+        free(cand);
+        return e;
+    }
+    free(ix_values);
 
     bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
     if (!cur_h) return BJ_ERR_OOM;
@@ -426,11 +507,11 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         if (r < 0) { rc = r; break; }
         if (r == 0) break;
         int m = 0;
-        rc = dc_matches(val, vlen, filter, filter_len, &m);
+        rc = qry_matches(val, vlen, filter, filter_len, &m);
         if (rc) break;
         if (m) {
             *found = 1;
-            rc = dup_bytes(val, vlen, out, out_len);
+            rc = dbuf_dup(val, vlen, out, out_len);
             break;
         }
     }
@@ -439,36 +520,60 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 }
 
 int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
-            uint8_t **out, size_t *out_len) {
+            const qry_options *opts, uint8_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
-    bj_builder *b = bj_builder_new();
-    if (!b) return BJ_ERR_OOM;
 
-    int e = bj_begin_array(b);
-    bpt_cursor *cur_h = NULL;
-    if (!e) {
-        cur_h = bpt_cursor_open(c->primary, NULL, NULL);
+    int e = qry_validate_options(opts);
+    if (e) return e;
+
+    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+    int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    if (e) return e;
+
+    qry_doc *matches = NULL;
+    size_t match_count = 0, match_cap = 0;
+
+    if (planned) {
+        uint8_t *cand = NULL; size_t cand_len = 0;
+        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+        free(ix_values);
+        if (e) { free(cand); return e; }
+
+        cur cc = { cand, cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, cc.d + dstart, cc.pos - dstart);
+            if (e) break;
+        }
+        free(cand);
+    } else {
+        free(ix_values);
+        bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
         if (!cur_h) e = BJ_ERR_OOM;
+        while (!e && cur_h) {
+            bpt_key k; const uint8_t *val; size_t vlen;
+            int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+            if (r < 0) { e = r; break; }
+            if (r == 0) break;
+            int m = 0;
+            e = qry_matches(val, vlen, filter, filter_len, &m);
+            if (e) break;
+            if (m) e = push_match(&matches, &match_count, &match_cap, val, vlen);
+        }
+        if (cur_h) bpt_cursor_close(cur_h);
     }
-    while (!e && cur_h) {
-        bpt_key k; const uint8_t *val; size_t vlen;
-        int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
-        if (r < 0) { e = r; break; }
-        if (r == 0) break;
-        int m = 0;
-        e = dc_matches(val, vlen, filter, filter_len, &m);
-        if (e) break;
-        if (m) e = bj_put_raw(b, val, (uint32_t)vlen);
-    }
-    if (cur_h) bpt_cursor_close(cur_h);
-    if (!e) e = bj_end_array(b);
 
-    if (!e) {
-        size_t n; const uint8_t *p = bj_builder_data(b, &n);
-        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
-        else e = dup_bytes(p, n, out, out_len);
-    }
-    bj_builder_free(b);
+    if (!e) e = qry_collect(matches, match_count, opts, out, out_len);
+    free_matches(matches, match_count);
     return e;
 }
 
@@ -522,7 +627,7 @@ static int splice_id(const uint8_t *replacement, size_t replacement_len,
     if (!e) {
         size_t n; const uint8_t *p = bj_builder_data(b, &n);
         if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
-        else e = dup_bytes(p, n, out, out_len);
+        else e = dbuf_dup(p, n, out, out_len);
     }
     bj_builder_free(b);
     return e;
@@ -597,9 +702,39 @@ int dc_count(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int64
     if (e) return e;
     if (fcount == 0) { *out_count = bpt_size(c->primary); return BJ_OK; }
 
+    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+    int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    if (e) return e;
+
+    int64_t n = 0;
+    if (planned) {
+        uint8_t *cand = NULL; size_t cand_len = 0;
+        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+        free(ix_values);
+        if (e) { free(cand); return e; }
+        cur cc = { cand, cand_len, 0 };
+        uint32_t ccount;
+        e = array_begin(&cc, &ccount);
+        for (uint32_t i = 0; !e && i < ccount; i++) {
+            size_t dstart = cc.pos;
+            e = skip_value(&cc);
+            if (e) break;
+            int m = 0;
+            e = qry_matches(cc.d + dstart, cc.pos - dstart, filter, filter_len, &m);
+            if (e) break;
+            if (m) n++;
+        }
+        free(cand);
+        if (e) return e;
+        *out_count = n;
+        return BJ_OK;
+    }
+    free(ix_values);
+
     bpt_cursor *cur_h = bpt_cursor_open(c->primary, NULL, NULL);
     if (!cur_h) return BJ_ERR_OOM;
-    int64_t n = 0;
     int rc = BJ_OK;
     for (;;) {
         bpt_key k; const uint8_t *val; size_t vlen;
@@ -607,7 +742,7 @@ int dc_count(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int64
         if (r < 0) { rc = r; break; }
         if (r == 0) break;
         int m = 0;
-        rc = dc_matches(val, vlen, filter, filter_len, &m);
+        rc = qry_matches(val, vlen, filter, filter_len, &m);
         if (rc) break;
         if (m) n++;
     }

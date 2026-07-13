@@ -17,17 +17,20 @@
  * the storage engine inventing it, and keeps randomness/clock access (which
  * WASM has no portable source for) out of C entirely.
  *
- * Filters are themselves binjson OBJECTs, matched by top-level field
- * equality: a filter field matches a document field when their encoded
- * value bytes are identical. Because binjson's encoder is a deterministic
- * function of the JS value, equal values always produce identical bytes —
- * including for embedded documents and arrays, where byte equality
- * reproduces MongoDB's own exact-match semantics (field order matters for
- * embedded-document equality queries in real MongoDB too). No $operators
- * yet, and find/findOne/count do not consult indexes — that's the query
- * planner, a later milestone; dc_collection_find_by_index is a low-level
- * index-scan primitive exposed for that milestone (and for verifying an
- * index directly) to build on.
+ * Filters are matched by query.h's operator-aware evaluator ($eq/$ne/$gt/
+ * $gte/$lt/$lte/$in/$nin/$exists/$not/$and/$or/$nor, dotted field paths,
+ * implicit array-element matching — see query.h for the exact rules and
+ * deliberate omissions). dc_find additionally applies sort/skip/limit/
+ * projection (query.h again) to the matched set.
+ *
+ * dc_find/dc_find_one/dc_count use an attached index instead of a full
+ * collection scan when `filter`'s top level is a pure AND of bare-value/
+ * {$eq: v} conditions that together pin every field of some index (see
+ * plan_equality_index in db.c) — an equality-only planner; range
+ * conditions ($gt et al.) and filters combined with $and/$or/$nor at the
+ * top level always fall back to a full scan for now. Every path re-applies
+ * the *full* filter to whatever candidate set it gathers, so correctness
+ * never depends on which plan was chosen — only speed does.
  *
  * Known gap (see docs/db-plan.md milestone 5): index maintenance is not
  * transactional with the primary write. If a crash or an index-maintenance
@@ -46,6 +49,7 @@
 
 #include "binjson.h"
 #include "bplustree.h"
+#include "query.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,20 +125,21 @@ int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len);
 /*
  * First document matching `filter` (a binjson OBJECT; {} matches every
  * document). *found is 1/0; when found, writes a freshly malloc'd copy of
- * the document through *out / *out_len (caller frees). The special case
- * filter == {_id: <oid>} is an O(log n) bpt_search; anything else is a full
- * scan of the primary tree (indexes are not consulted yet).
+ * the document through *out / *out_len (caller frees). filter == {_id:
+ * <oid>} is always an O(log n) bpt_search; otherwise see db.h's top
+ * comment for when an attached index is used.
  */
 int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                 int *found, uint8_t **out, size_t *out_len);
 
 /*
  * Every document matching `filter`, as a binjson ARRAY of documents (not
- * {key,value} pairs). Writes a freshly malloc'd buffer through *out / *out_len
- * (caller frees).
+ * {key,value} pairs), with `opts` (may be NULL for none) applied — see
+ * query.h for sort/skip/limit/projection semantics. Writes a freshly
+ * malloc'd buffer through *out / *out_len (caller frees).
  */
 int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
-            uint8_t **out, size_t *out_len);
+            const qry_options *opts, uint8_t **out, size_t *out_len);
 
 /* Delete the first document matching `filter`, from the primary tree and
  * every attached index. *deleted is 1/0. */

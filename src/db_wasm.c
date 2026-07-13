@@ -79,10 +79,23 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one(dcw_out *o, dc_collection *c,
     return found ? 1 : 0;
 }
 
+/* `sort`/`projection` may be NULL (with length 0) for "none"; skip/limit
+ * cross the bridge as doubles (like every other count/size value here) and
+ * 0 means "no skip" / "no limit" -- see query.h. */
 EMSCRIPTEN_KEEPALIVE int dcw_find(dcw_out *o, dc_collection *c,
-                                  const uint8_t *filter, int filter_len) {
+                                  const uint8_t *filter, int filter_len,
+                                  const uint8_t *sort, int sort_len,
+                                  double skip, double limit,
+                                  const uint8_t *projection, int projection_len) {
     reset_out(o);
-    return dc_find(c, filter, (uint32_t)filter_len, &o->buf, &o->len);
+    qry_options opts;
+    opts.sort = sort_len > 0 ? sort : NULL;
+    opts.sort_len = sort_len > 0 ? (uint32_t)sort_len : 0;
+    opts.skip = (int64_t)skip;
+    opts.limit = (int64_t)limit;
+    opts.projection = projection_len > 0 ? projection : NULL;
+    opts.projection_len = projection_len > 0 ? (uint32_t)projection_len : 0;
+    return dc_find(c, filter, (uint32_t)filter_len, &opts, &o->buf, &o->len);
 }
 
 /* Returns 1 if deleted, 0 if not found, negative on error. */
