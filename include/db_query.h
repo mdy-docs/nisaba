@@ -95,6 +95,19 @@ int val_list_push(val_list *l, const uint8_t *ptr, size_t len);
 void val_list_free(val_list *l);
 int value_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen);
 
+/* -2 = incomparable (different domains, or not number/string/date), else
+ * -1/0/1. See this header's top comment: only number-vs-number, string-
+ * vs-string, or Date-vs-Date order. Exposed for db_update.c's $min/$max/
+ * $push's $sort modifier. */
+int qry_value_cmp(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen);
+
+/* Evaluate operator-expression `expr` (e.g. {$gt: 5}) against a single
+ * resolved value (not a field path) -- exposed for db_update.c's $pull
+ * query-condition support ({$pull: {field: {$gt: 5}}}), reusing the same
+ * per-key operator dispatch qry_matches's field conditions use. */
+int qry_value_matches_expr(const uint8_t *value, size_t value_len,
+                           const uint8_t *expr, size_t expr_len, int *out_match);
+
 /*
  * True (via *is_expr) iff `value` is a binjson OBJECT whose keys are all
  * $-prefixed (an "operator expression", e.g. {$gt: 5}) rather than a

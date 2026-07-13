@@ -1937,7 +1937,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         uint8_t *seed = NULL; size_t seed_len = 0;
         e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
         uint8_t *updated = NULL; size_t updated_len = 0;
-        if (!e) e = upd_apply(seed, seed_len, update, update_len, &updated, &updated_len);
+        if (!e) e = upd_apply(seed, seed_len, update, update_len, 1, &updated, &updated_len);
         free(seed);
         if (e) { free(updated); return e; }
         uint8_t *spliced = NULL; size_t spliced_len = 0;
@@ -1956,7 +1956,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     if (e) { free(doc); return e; }
 
     uint8_t *updated = NULL; size_t updated_len = 0;
-    e = upd_apply(doc, doc_len, update, update_len, &updated, &updated_len);
+    e = upd_apply(doc, doc_len, update, update_len, 0, &updated, &updated_len);
     if (e) { free(doc); free(updated); return e; }
 
     e = remove_from_indexes(c, doc, doc_len, id);
@@ -2039,7 +2039,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             uint8_t *seed = NULL; size_t seed_len = 0;
             e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
             uint8_t *updated = NULL; size_t updated_len = 0;
-            if (!e) e = upd_apply(seed, seed_len, update, update_len, &updated, &updated_len);
+            if (!e) e = upd_apply(seed, seed_len, update, update_len, 1, &updated, &updated_len);
             free(seed);
             uint8_t *spliced = NULL; size_t spliced_len = 0;
             if (!e) e = splice_id(updated, updated_len, default_id, &spliced, &spliced_len);
@@ -2055,7 +2055,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             e = dc_get_id(matches[i].ptr, (uint32_t)matches[i].len, id);
             if (e) break;
             uint8_t *updated = NULL; size_t updated_len = 0;
-            e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, &updated, &updated_len);
+            e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, 0, &updated, &updated_len);
             if (e) { free(updated); break; }
             e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
             if (!e) e = check_unique_indexes(c, updated, updated_len);

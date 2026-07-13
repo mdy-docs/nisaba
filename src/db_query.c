@@ -89,7 +89,7 @@ int value_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
 
 /* -2 = incomparable (different domains, or not number/string), else
  * -1/0/1. See db_query.h: only number-vs-number and string-vs-string order. */
-static int value_cmp(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+int qry_value_cmp(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
     if (alen < 1 || blen < 1) return -2;
     uint8_t ta = a[0], tb = b[0];
     int a_num = (ta == BJ_TYPE_INT || ta == BJ_TYPE_FLOAT);
@@ -179,7 +179,7 @@ typedef enum { QRY_GT, QRY_GTE, QRY_LT, QRY_LTE } cmp_mode;
 
 static int op_compare(const val_list *cands, const uint8_t *operand, size_t operand_len, cmp_mode mode) {
     for (uint32_t i = 0; i < cands->count; i++) {
-        int c = value_cmp(cands->items[i].ptr, cands->items[i].len, operand, operand_len);
+        int c = qry_value_cmp(cands->items[i].ptr, cands->items[i].len, operand, operand_len);
         if (c == -2) continue;
         if (mode == QRY_GT && c > 0) return 1;
         if (mode == QRY_GTE && c >= 0) return 1;
@@ -465,6 +465,20 @@ static int eval_operator_expr(const uint8_t *doc, size_t doc_len,
     return BJ_OK;
 }
 
+/* Evaluate operator-expression `expr` against a single resolved value (not
+ * a field path) -- exposed for db_update.c's $pull query-condition support.
+ * Reuses the same expand_candidates + eval_operator_expr machinery
+ * $elemMatch's operator-expression branch already uses internally. */
+int qry_value_matches_expr(const uint8_t *value, size_t value_len,
+                           const uint8_t *expr, size_t expr_len, int *out_match) {
+    val_list cands; memset(&cands, 0, sizeof(cands));
+    int e = expand_candidates(value, value_len, &cands);
+    if (e) { val_list_free(&cands); return e; }
+    e = eval_operator_expr(NULL, 0, NULL, 0, 1, &cands, value, value_len, expr, expr_len, out_match);
+    val_list_free(&cands);
+    return e;
+}
+
 static int eval_field_condition(const uint8_t *doc, size_t doc_len,
                                 const uint8_t *path, uint32_t path_len,
                                 const uint8_t *cond, size_t cond_len, int *out_match) {
@@ -614,7 +628,7 @@ static int compare_by_sort(const uint8_t *a, size_t alen, const uint8_t *b, size
         else if (!af) cmp = -1;
         else if (!bf) cmp = 1;
         else {
-            int vc2 = value_cmp(av, al, bv, bl);
+            int vc2 = qry_value_cmp(av, al, bv, bl);
             cmp = (vc2 == -2) ? 0 : vc2;
         }
         if (cmp != 0) return dir < 0 ? -cmp : cmp;
