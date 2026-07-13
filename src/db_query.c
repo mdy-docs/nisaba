@@ -4,6 +4,7 @@
 #include "db_query.h"
 #include "bjcursor.h"
 #include "dbuf.h"
+#include "regex.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -193,16 +194,97 @@ static int op_compare(const val_list *cands, const uint8_t *operand, size_t oper
 static int eval_filter(const uint8_t *doc, size_t doc_len,
                        const uint8_t *filter, size_t filter_len, int *out_match);
 
-/* Evaluate one operator-expression object (all keys $-prefixed) against a
- * field resolved to `found`/`cands`. `path`/`path_len` is only needed for
- * $not's recursive re-resolution (it re-evaluates the same field). */
-static int eval_operator_expr(const uint8_t *doc, size_t doc_len,
-                              const uint8_t *path, uint32_t path_len,
-                              int found, const val_list *cands,
-                              const uint8_t *expr, size_t expr_len, int *out_match) {
+/* ---- $type ----------------------------------------------------------------- */
+
+/* MongoDB-familiar string aliases, not BSON's numeric type codes (this
+ * isn't BSON; a string is the natural fit for a JS-facing API). "number"/
+ * "bool" each cover two BJ_TYPE_* tags, matching how JS treats every
+ * number/boolean uniformly elsewhere in this codebase. */
+typedef enum {
+    TA_STRING, TA_NUMBER, TA_INT, TA_DOUBLE, TA_BOOL,
+    TA_DATE, TA_OID, TA_ARRAY, TA_OBJECT, TA_NULL
+} type_alias;
+
+static int resolve_type_alias(const uint8_t *alias, uint32_t alen, type_alias *out) {
+    if (alen == 6 && !memcmp(alias, "string", 6)) { *out = TA_STRING; return BJ_OK; }
+    if (alen == 6 && !memcmp(alias, "number", 6)) { *out = TA_NUMBER; return BJ_OK; }
+    if (alen == 3 && !memcmp(alias, "int", 3)) { *out = TA_INT; return BJ_OK; }
+    if (alen == 6 && !memcmp(alias, "double", 6)) { *out = TA_DOUBLE; return BJ_OK; }
+    if (alen == 4 && !memcmp(alias, "bool", 4)) { *out = TA_BOOL; return BJ_OK; }
+    if (alen == 4 && !memcmp(alias, "date", 4)) { *out = TA_DATE; return BJ_OK; }
+    if (alen == 8 && !memcmp(alias, "objectId", 8)) { *out = TA_OID; return BJ_OK; }
+    if (alen == 5 && !memcmp(alias, "array", 5)) { *out = TA_ARRAY; return BJ_OK; }
+    if (alen == 6 && !memcmp(alias, "object", 6)) { *out = TA_OBJECT; return BJ_OK; }
+    if (alen == 4 && !memcmp(alias, "null", 4)) { *out = TA_NULL; return BJ_OK; }
+    return BJ_ERR_STATE;
+}
+static int type_alias_matches_tag(type_alias ta, uint8_t tag) {
+    switch (ta) {
+    case TA_STRING: return tag == BJ_TYPE_STRING;
+    case TA_NUMBER: return tag == BJ_TYPE_INT || tag == BJ_TYPE_FLOAT;
+    case TA_INT:    return tag == BJ_TYPE_INT;
+    case TA_DOUBLE: return tag == BJ_TYPE_FLOAT;
+    case TA_BOOL:   return tag == BJ_TYPE_TRUE || tag == BJ_TYPE_FALSE;
+    case TA_DATE:   return tag == BJ_TYPE_DATE;
+    case TA_OID:    return tag == BJ_TYPE_OID;
+    case TA_ARRAY:  return tag == BJ_TYPE_ARRAY;
+    case TA_OBJECT: return tag == BJ_TYPE_OBJECT;
+    case TA_NULL:   return tag == BJ_TYPE_NULL;
+    }
+    return 0;
+}
+
+/* ---- $regex/$options -------------------------------------------------------- */
+
+/* $options is a modifier paired with $regex in the *same* operator-
+ * expression object, not a standalone operator -- pre-scanned once so
+ * $regex's handler (reached in per-key order below) already has the flags
+ * regardless of which key came first. */
+static int find_options(const uint8_t *expr, size_t expr_len,
+                        const uint8_t **out_opts, uint32_t *out_opts_len, int *found_options) {
     cur c = { expr, expr_len, 0 };
     uint32_t count;
     int e = object_begin(&c, &count);
+    if (e) return e;
+    *out_opts = NULL; *out_opts_len = 0; *found_options = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *kp; uint32_t klen;
+        e = take_key(&c, &kp, &klen);
+        if (e) return e;
+        size_t vstart = c.pos;
+        e = skip_value(&c);
+        if (e) return e;
+        if (klen == 8 && memcmp(kp, "$options", 8) == 0) {
+            if (c.pos - vstart < 1 || c.d[vstart] != BJ_TYPE_STRING) return BJ_ERR_STATE;
+            cur oc = { c.d + vstart, c.pos - vstart, 0 };
+            e = take_string(&oc, out_opts, out_opts_len);
+            if (e) return e;
+            *found_options = 1;
+        }
+    }
+    return BJ_OK;
+}
+
+/* Evaluate one operator-expression object (all keys $-prefixed) against a
+ * field resolved to `found`/`cands`/`raw_vp`/`raw_vl`. `path`/`path_len` is
+ * only needed for $not's recursive re-resolution (it re-evaluates the same
+ * field). `raw_vp`/`raw_vl` (the field's own resolved span, NULL/0 if
+ * `!found`) are only needed by $size/$elemMatch, which must distinguish
+ * "the array itself" from `cands`' flattened whole-value-plus-elements
+ * list every other operator uses for its any-element matching. */
+static int eval_operator_expr(const uint8_t *doc, size_t doc_len,
+                              const uint8_t *path, uint32_t path_len,
+                              int found, const val_list *cands,
+                              const uint8_t *raw_vp, size_t raw_vl,
+                              const uint8_t *expr, size_t expr_len, int *out_match) {
+    const uint8_t *opts = NULL; uint32_t opts_len = 0; int found_options = 0;
+    int e = find_options(expr, expr_len, &opts, &opts_len, &found_options);
+    if (e) return e;
+    int saw_regex = 0;
+
+    cur c = { expr, expr_len, 0 };
+    uint32_t count;
+    e = object_begin(&c, &count);
     if (e) return e;
 
     for (uint32_t i = 0; i < count; i++) {
@@ -250,18 +332,135 @@ static int eval_operator_expr(const uint8_t *doc, size_t doc_len,
             if (e) return e;
             if (!inner_is_expr) return BJ_ERR_STATE; /* $not requires an operator expression */
             int inner_match = 0;
-            e = eval_operator_expr(doc, doc_len, path, path_len, found, cands, operand, operand_len, &inner_match);
+            e = eval_operator_expr(doc, doc_len, path, path_len, found, cands, raw_vp, raw_vl, operand, operand_len, &inner_match);
             if (e) return e;
             m = !inner_match;
+        } else if (klen == 5 && memcmp(kp, "$size", 5) == 0) {
+            cur oc = { operand, operand_len, 0 };
+            double want;
+            if (read_number(&oc, &want) || want < 0 || want != (double)(int64_t)want) return BJ_ERR_STATE;
+            m = 0;
+            if (found && raw_vl >= 1 && raw_vp[0] == BJ_TYPE_ARRAY) {
+                cur ac = { raw_vp, raw_vl, 0 };
+                uint32_t acount;
+                e = array_begin(&ac, &acount);
+                if (e) return e;
+                m = (acount == (uint32_t)(int64_t)want);
+            }
+        } else if (klen == 4 && memcmp(kp, "$all", 4) == 0) {
+            cur oc = { operand, operand_len, 0 };
+            uint32_t ocount;
+            e = array_begin(&oc, &ocount);
+            if (e) return e;
+            m = found && ocount > 0;
+            for (uint32_t oi = 0; m && oi < ocount; oi++) {
+                size_t ostart = oc.pos;
+                e = skip_value(&oc);
+                if (e) return e;
+                if (!op_eq(cands, oc.d + ostart, oc.pos - ostart)) m = 0;
+            }
+        } else if (klen == 5 && memcmp(kp, "$type", 5) == 0) {
+            if (operand_len < 1 || operand[0] != BJ_TYPE_STRING) return BJ_ERR_STATE;
+            cur oc = { operand, operand_len, 0 };
+            const uint8_t *alias; uint32_t alen;
+            e = take_string(&oc, &alias, &alen);
+            if (e) return e;
+            type_alias ta;
+            e = resolve_type_alias(alias, alen, &ta);
+            if (e) return e;
+            m = 0;
+            for (uint32_t ci = 0; found && ci < cands->count; ci++) {
+                if (cands->items[ci].len >= 1 && type_alias_matches_tag(ta, cands->items[ci].ptr[0])) { m = 1; break; }
+            }
+        } else if (klen == 4 && memcmp(kp, "$mod", 4) == 0) {
+            cur oc = { operand, operand_len, 0 };
+            uint32_t ocount;
+            e = array_begin(&oc, &ocount);
+            if (e) return e;
+            if (ocount != 2) return BJ_ERR_STATE;
+            size_t s0 = oc.pos; e = skip_value(&oc); if (e) return e;
+            size_t s1 = oc.pos; e = skip_value(&oc); if (e) return e;
+            cur dvc = { oc.d + s0, s1 - s0, 0 }; double divisor;
+            cur rvc = { oc.d + s1, oc.pos - s1, 0 }; double remainder;
+            if (read_number(&dvc, &divisor) || read_number(&rvc, &remainder)) return BJ_ERR_STATE;
+            int64_t idiv = (int64_t)divisor, irem = (int64_t)remainder;
+            if (idiv == 0) return BJ_ERR_STATE;
+            m = 0;
+            for (uint32_t ci = 0; found && ci < cands->count; ci++) {
+                const uint8_t *cp = cands->items[ci].ptr; size_t cl = cands->items[ci].len;
+                if (cl < 1 || (cp[0] != BJ_TYPE_INT && cp[0] != BJ_TYPE_FLOAT)) continue;
+                cur cc = { cp, cl, 0 }; double v;
+                if (read_number(&cc, &v)) continue;
+                if ((int64_t)v % idiv == irem) { m = 1; break; }
+            }
+        } else if (klen == 10 && memcmp(kp, "$elemMatch", 10) == 0) {
+            if (operand_len < 1 || operand[0] != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
+            int sub_is_expr = 0;
+            e = qry_is_operator_expr(operand, operand_len, &sub_is_expr);
+            if (e) return e;
+            m = 0;
+            if (found && raw_vl >= 1 && raw_vp[0] == BJ_TYPE_ARRAY) {
+                cur ac = { raw_vp, raw_vl, 0 };
+                uint32_t acount;
+                e = array_begin(&ac, &acount);
+                if (e) return e;
+                for (uint32_t ei = 0; !m && ei < acount; ei++) {
+                    size_t estart = ac.pos;
+                    e = skip_value(&ac);
+                    if (e) return e;
+                    const uint8_t *elem = ac.d + estart; size_t elen = ac.pos - estart;
+                    if (sub_is_expr) {
+                        val_list ecands; memset(&ecands, 0, sizeof(ecands));
+                        e = expand_candidates(elem, elen, &ecands);
+                        if (e) { val_list_free(&ecands); return e; }
+                        int em = 0;
+                        e = eval_operator_expr(doc, doc_len, path, path_len, 1, &ecands, elem, elen, operand, operand_len, &em);
+                        val_list_free(&ecands);
+                        if (e) return e;
+                        if (em) m = 1;
+                    } else if (elen >= 1 && elem[0] == BJ_TYPE_OBJECT) {
+                        int em = 0;
+                        e = eval_filter(elem, elen, operand, operand_len, &em);
+                        if (e) return e;
+                        if (em) m = 1;
+                    }
+                }
+            }
+        } else if (klen == 6 && memcmp(kp, "$regex", 6) == 0) {
+            if (operand_len < 1 || operand[0] != BJ_TYPE_STRING) return BJ_ERR_STATE;
+            cur oc = { operand, operand_len, 0 };
+            const uint8_t *pat; uint32_t patlen;
+            e = take_string(&oc, &pat, &patlen);
+            if (e) return e;
+            int ignorecase = 0;
+            for (uint32_t fi = 0; fi < opts_len; fi++) {
+                if (opts[fi] == 'i') ignorecase = 1;
+                else return BJ_ERR_STATE; /* unsupported flag: hard error, not silently ignored */
+            }
+            m = 0;
+            for (uint32_t ci = 0; found && ci < cands->count; ci++) {
+                if (cands->items[ci].len < 1 || cands->items[ci].ptr[0] != BJ_TYPE_STRING) continue;
+                cur sc = { cands->items[ci].ptr, cands->items[ci].len, 0 };
+                const uint8_t *s; uint32_t slen;
+                e = take_string(&sc, &s, &slen);
+                if (e) return e;
+                int one = 0;
+                e = rx_match((const char *)pat, (int)patlen, ignorecase, (const char *)s, (int)slen, &one);
+                if (e) return e;
+                if (one) { m = 1; break; }
+            }
+            saw_regex = 1;
+        } else if (klen == 8 && memcmp(kp, "$options", 8) == 0) {
+            m = 1; /* neutral: already consumed by the find_options pre-scan */
         } else {
-            /* Unrecognized operator ($regex/$type/$size/$all/$elemMatch/...
-             * are not implemented yet): fail loudly rather than silently
+            /* Unrecognized operator: fail loudly rather than silently
              * matching everything -- see db_query.h. */
             return BJ_ERR_STATE;
         }
 
         if (!m) { *out_match = 0; return BJ_OK; }
     }
+    if (found_options && !saw_regex) return BJ_ERR_STATE; /* $options requires a sibling $regex */
     *out_match = 1;
     return BJ_OK;
 }
@@ -289,7 +488,7 @@ static int eval_field_condition(const uint8_t *doc, size_t doc_len,
         return BJ_OK;
     }
 
-    e = eval_operator_expr(doc, doc_len, path, path_len, found, &cands, cond, cond_len, out_match);
+    e = eval_operator_expr(doc, doc_len, path, path_len, found, &cands, vp, vl, cond, cond_len, out_match);
     val_list_free(&cands);
     return e;
 }

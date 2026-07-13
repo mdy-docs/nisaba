@@ -14,29 +14,46 @@
  *
  * A field's value is either a literal (matched by equality) or an
  * "operator expression" — an OBJECT whose keys are *all* $-prefixed
- * ($eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $exists, $not). Multiple
+ * ($eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $exists, $not, $size, $all,
+ * $type, $mod, $elemMatch, $regex + $options — milestone 11). Multiple
  * operators on one field are ANDed (e.g. {age: {$gte: 18, $lt: 65}}).
  * Any other $-prefixed key is an error (BJ_ERR_STATE) rather than a
- * silent no-op — an unrecognized operator (e.g. $regex, $type, $elemMatch,
- * $size, $all — not implemented yet) must never be mistaken for "matches
- * everything".
+ * silent no-op — an unrecognized operator must never be mistaken for
+ * "matches everything".
  *
- * If a resolved field value is an ARRAY, every operator except $exists
- * matches if it holds for the array value itself *or* for any one of its
- * elements (one level deep — matching MongoDB's default array-field
- * behavior for a plain path, without $elemMatch's element-wide-AND
- * semantics, which is deferred).
+ * If a resolved field value is an ARRAY, every operator except $exists/
+ * $size/$elemMatch matches if it holds for the array value itself *or*
+ * for any one of its elements (one level deep — matching MongoDB's
+ * default array-field behavior for a plain path). $size checks the
+ * array's own element count (not its elements). $elemMatch is the one
+ * operator with element-*wide*-AND semantics: its sub-query (an operator
+ * expression for a scalar-element array, or a plain query object for an
+ * array of subdocuments) must hold entirely against *one* element, unlike
+ * every other operator's any-element-independently matching.
+ *
+ * $type accepts MongoDB-familiar string aliases ("string", "number" (INT
+ * or FLOAT), "int", "double", "bool" (TRUE or FALSE), "date", "objectId",
+ * "array", "object", "null") rather than BSON's numeric type codes — this
+ * isn't BSON, and a string is the natural fit for a JS-facing API.
+ *
+ * $regex only supports the operator-expression form ({field: {$regex:
+ * "pattern", $options: "flags"}}, both plain strings) — binjson has no
+ * BSON-regex wire type, so a bare native-RegExp-literal filter value isn't
+ * representable in the codec at all. See regex.h for the supported
+ * pattern syntax (a small backtracking engine, not full PCRE) and the `i`
+ * flag being the only one implemented at this layer.
  *
  * Equality ($eq, and bare-literal matching) is exact encoded-byte
  * equality, same rationale as db.h: binjson's encoder is a deterministic
  * function of the JS value, so this reproduces MongoDB's embedded-
  * document/array exact-match semantics for free. A missing field never
  * equality-matches even a literal `null` (MongoDB's null-matches-missing
- * quirk is not implemented). Ordering ($gt/$gte/$lt/$lte) only compares
- * same-domain values — number vs number (INT and FLOAT unified, as
- * everywhere else in this codebase) or string vs string (byte-wise) — a
- * cross-domain comparison (or against a non-number/non-string) never
- * matches; MongoDB's full cross-BSON-type ordering is not implemented.
+ * quirk is not implemented). Ordering ($gt/$gte/$lt/$lte/$mod's numeric
+ * candidates) only compares same-domain values — number vs number (INT
+ * and FLOAT unified, as everywhere else in this codebase), string vs
+ * string (byte-wise), or (milestone 9, for TTL) Date vs Date — a cross-
+ * domain comparison (or against an unsupported type) never matches;
+ * MongoDB's full cross-BSON-type ordering is not implemented.
  */
 #ifndef DB_QUERY_H
 #define DB_QUERY_H
