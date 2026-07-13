@@ -58,12 +58,24 @@
  * point-in-shape math in db_query.c for what is, in practice, an uncommon
  * unindexed-geo-scan use case.
  *
- * Known gap (see docs/db-plan.md milestone 5): index maintenance is not
- * transactional with the primary write. If a crash or an index-maintenance
- * error (e.g. a document missing an indexed field) happens between updating
- * the primary tree and an index tree, they can end up inconsistent. This
- * mirrors textindex.c's cross-tree consistency gap before its own journal
- * milestone (docs/textindex-atomicity.md).
+ * Crash atomicity (milestone 5): a host that supplies a journal via
+ * dc_collection_recover gets every document write (dc_insert_one/
+ * dc_delete_one/dc_replace_one/dc_update_one, and each matched document
+ * within dc_update_many) made atomic across the primary tree and every
+ * currently attached index's file(s) — a crash between updating the primary
+ * tree and an index tree rolls back to the last consistent write on reopen,
+ * rather than leaving them permanently out of sync. This generalizes
+ * textindex.c's fixed-3-tree journal (docs/textindex-atomicity.md) to a
+ * variable number of files; see dc_collection_recover's doc comment below
+ * and docs/db-plan.md milestone 5 for the full design. Scope note: this is
+ * per-document-write atomicity, not multi-document ACID transactions/
+ * sessions — dc_update_many's documents are not atomic *with each other*,
+ * matching real MongoDB's own non-session updateMany semantics. Index
+ * *creation* (dc_collection_add_index and friends) keeps its own pre-
+ * existing all-or-nothing bookkeeping-rollback story, unrelated to and
+ * unchanged by the journal. journal == NULL (dc_collection_recover never
+ * called, or called with NULL) disables journaling entirely — the pre-
+ * milestone-5 behavior.
  *
  * All operations return BJ_OK (0) or a negative BJ_ERR_* / DC_ERR_* code.
  */
@@ -113,6 +125,20 @@ void dc_collection_free(dc_collection *c);
 int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
                                bpt *index_tree,
                                const uint8_t *fields, uint32_t fields_len);
+
+/*
+ * Enable/disable the collection's cross-file commit journal and reconcile it
+ * against the primary tree + every currently attached index. Must be called
+ * once, after every dc_collection_attach_index/_attach_text_index/
+ * _attach_geo_index call for this collection has already run (mirrors
+ * textindex.h's tix_recover contract: right after every file is open) and
+ * before any write. journal == NULL disables journaling (the default set by
+ * dc_collection_open). Empty/absent journal: BJ_OK, adopt state as-is. A
+ * crash that lost more committed data than the journal can reconcile:
+ * BJ_ERR_STATE (refuses, matching tix_recover's own refusal case). See
+ * db.h's top comment and docs/db-plan.md milestone 5.
+ */
+int dc_collection_recover(dc_collection *c, const bj_io *journal);
 
 /*
  * Like dc_collection_attach_index, but also backfills `index_tree` (expected

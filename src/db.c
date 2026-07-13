@@ -13,6 +13,7 @@
 #include "db_query.h"
 #include "db_update.h"
 #include "bjcursor.h"
+#include "bjfile.h"
 #include "dbuf.h"
 
 #include <stdlib.h>
@@ -49,6 +50,8 @@ struct dc_collection {
     dc_index *indexes;           /* owned, dense array */
     uint32_t index_count;
     uint32_t index_cap;
+    bj_io journal;                /* stored by value -- see dc_collection_recover */
+    int has_journal;
 };
 
 static void free_index(dc_index *ix) {
@@ -98,6 +101,193 @@ static int append_index(dc_collection *c, dc_index *ix) {
     }
     c->indexes[c->index_count++] = *ix;
     return BJ_OK;
+}
+
+/*
+ * ---- Cross-collection commit journal (crash atomicity) --------------------
+ *
+ * Generalizes textindex.c's fixed-3-tree TIXJ journal (docs/textindex-
+ * atomicity.md) to a variable number of files: the primary tree plus every
+ * currently attached index's file(s) (equality/geo: 1, text: 3). One slot:
+ *
+ *   magic "DCTJ"(4) + version(4) + txn(8) + file_count(4) + N*8-byte lengths + crc32(4)
+ *
+ * Two slots ping-ponged at offset 0 and dctj_slot_size(n), exactly like
+ * TIXJ. `file_count` is part of the CRC'd payload: a slot whose stored count
+ * doesn't match the *current* live count (c->index_count-derived) is treated
+ * as undecodable, same as a CRC failure -- this matters because N changes
+ * whenever an index is created/dropped (see dctj_truncate's call sites,
+ * which keep every pair of slots ever compared at the same N).
+ *
+ * A collection with no secondary indexes needs no journal I/O at all: its
+ * primary tree is already atomic on its own (a single file with its own
+ * CRC'd commit trailer), so commit_journal/dc_collection_recover both skip
+ * work when c->index_count == 0.
+ */
+#define DCTJ_MAGIC   "DCTJ"
+#define DCTJ_VERSION 1
+
+static void wr32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void wr64le(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
+}
+
+/* One length per journaled resource: primary + one per attached index
+ * (equality/geo = 1 file, text = 3), in c->indexes registration order. */
+static uint32_t dctj_file_count(const dc_collection *c) {
+    uint32_t n = 1;
+    for (uint32_t i = 0; i < c->index_count; i++)
+        n += c->indexes[i].kind == DC_IDX_TEXT ? 3 : 1;
+    return n;
+}
+static size_t dctj_slot_size(uint32_t n) { return 24 + 8 * (size_t)n; }
+
+static void dctj_encode(uint8_t *s, uint64_t txn, uint32_t n, const uint64_t *lens) {
+    size_t sz = dctj_slot_size(n);
+    memset(s, 0, sz);
+    memcpy(s, DCTJ_MAGIC, 4);
+    wr32le(s + 4, DCTJ_VERSION);
+    wr64le(s + 8, txn);
+    wr32le(s + 16, n);
+    for (uint32_t i = 0; i < n; i++) wr64le(s + 20 + 8 * i, lens[i]);
+    wr32le(s + 20 + 8 * n, bjfile_crc32(0, s, 20 + 8 * n));
+}
+static int dctj_decode(const uint8_t *s, uint32_t n, uint64_t *txn, uint64_t *lens) {
+    if (memcmp(s, DCTJ_MAGIC, 4) != 0) return 0;
+    if (rdu32(s + 4) != DCTJ_VERSION) return 0;
+    if (rdu32(s + 16) != n) return 0; /* stale-N self-healing check */
+    if (rdu32(s + 20 + 8 * n) != bjfile_crc32(0, s, 20 + 8 * n)) return 0;
+    *txn = rdu64(s + 8);
+    for (uint32_t i = 0; i < n; i++) lens[i] = rdu64(s + 20 + 8 * i);
+    return 1;
+}
+
+/* Read both slots (sized for n files each), newest first. lens must have
+ * room for 2*n uint64_t. Returns 0/1/2 decodable slots, or a negative
+ * BJ_ERR_* on I/O failure. */
+static int dctj_read(const bj_io *j, uint32_t n, uint64_t txn[2], uint64_t *lens) {
+    size_t slot_sz = dctj_slot_size(n);
+    uint8_t *buf = (uint8_t *)calloc(1, 2 * slot_sz);
+    if (!buf) return BJ_ERR_OOM;
+    uint64_t fsz = j->size(j->ctx);
+    if (fsz > 0) {
+        uint64_t want64 = fsz < 2 * slot_sz ? fsz : 2 * slot_sz;
+        int64_t got = j->read(j->ctx, 0, buf, (uint32_t)want64);
+        if (got < 0) { free(buf); return (int)got; }
+    }
+    uint64_t t0, t1;
+    uint64_t *l0 = (uint64_t *)malloc(n * sizeof(uint64_t));
+    uint64_t *l1 = (uint64_t *)malloc(n * sizeof(uint64_t));
+    if (!l0 || !l1) { free(buf); free(l0); free(l1); return BJ_ERR_OOM; }
+    int v0 = dctj_decode(buf, n, &t0, l0);
+    int v1 = dctj_decode(buf + slot_sz, n, &t1, l1);
+    int result;
+    if (v0 && v1) {
+        int newer0 = t0 >= t1;
+        txn[0] = newer0 ? t0 : t1;
+        memcpy(lens, newer0 ? l0 : l1, n * sizeof(uint64_t));
+        txn[1] = newer0 ? t1 : t0;
+        memcpy(lens + n, newer0 ? l1 : l0, n * sizeof(uint64_t));
+        result = 2;
+    } else if (v0 || v1) {
+        txn[0] = v0 ? t0 : t1;
+        memcpy(lens, v0 ? l0 : l1, n * sizeof(uint64_t));
+        result = 1;
+    } else {
+        result = 0;
+    }
+    free(buf); free(l0); free(l1);
+    return result;
+}
+
+/* Reset the journal to empty ahead of an index-set change (see the file
+ * comment above): an empty journal imposes no constraint regardless of what
+ * N becomes next, keeping every pair of slots ever compared at the same N. */
+static int dctj_truncate(dc_collection *c) {
+    if (!c->has_journal || !c->journal.truncate) return BJ_OK;
+    int32_t e = c->journal.truncate(c->journal.ctx, 0);
+    return e ? (int)e : BJ_OK;
+}
+
+static void dctj_gather_lens(dc_collection *c, uint64_t *lens) {
+    uint32_t i = 0;
+    lens[i++] = bpt_file_len(c->primary);
+    for (uint32_t k = 0; k < c->index_count; k++) {
+        dc_index *ix = &c->indexes[k];
+        if (ix->kind == DC_IDX_EQUALITY) lens[i++] = bpt_file_len(ix->tree);
+        else if (ix->kind == DC_IDX_TEXT) {
+            lens[i++] = bpt_file_len(ix->tix_index);
+            lens[i++] = bpt_file_len(ix->tix_doc_terms);
+            lens[i++] = bpt_file_len(ix->tix_doc_lengths);
+        } else lens[i++] = rtree_file_len(ix->rt);
+    }
+}
+static int dctj_rewind_all(dc_collection *c, const uint64_t *lens) {
+    uint32_t i = 0;
+    int e = bpt_rewind(c->primary, lens[i++]);
+    for (uint32_t k = 0; !e && k < c->index_count; k++) {
+        dc_index *ix = &c->indexes[k];
+        if (ix->kind == DC_IDX_EQUALITY) e = bpt_rewind(ix->tree, lens[i++]);
+        else if (ix->kind == DC_IDX_TEXT) {
+            e = bpt_rewind(ix->tix_index, lens[i++]);
+            if (!e) e = bpt_rewind(ix->tix_doc_terms, lens[i++]);
+            if (!e) e = bpt_rewind(ix->tix_doc_lengths, lens[i++]);
+        } else e = rtree_rewind(ix->rt, lens[i++]);
+    }
+    return e;
+}
+
+/* Record the current file lengths as one committed transaction. No-op if no
+ * journal is set, or the collection has no secondary indexes. */
+static int commit_journal(dc_collection *c) {
+    if (!c->has_journal || c->index_count == 0) return BJ_OK;
+    uint32_t n = dctj_file_count(c);
+    uint64_t txn[2];
+    uint64_t *lens = (uint64_t *)malloc(2 * n * sizeof(uint64_t));
+    if (!lens) return BJ_ERR_OOM;
+    int cnt = dctj_read(&c->journal, n, txn, lens);
+    if (cnt < 0) { free(lens); return cnt; }
+    uint64_t next = cnt ? txn[0] + 1 : 1;
+    uint64_t *cur = (uint64_t *)malloc(n * sizeof(uint64_t));
+    if (!cur) { free(lens); return BJ_ERR_OOM; }
+    dctj_gather_lens(c, cur);
+    size_t sz = dctj_slot_size(n);
+    uint8_t *s = (uint8_t *)malloc(sz);
+    if (!s) { free(lens); free(cur); return BJ_ERR_OOM; }
+    dctj_encode(s, next, n, cur);
+    int32_t w = c->journal.write(c->journal.ctx, (next & 1) ? 0 : sz, s, (uint32_t)sz);
+    free(lens); free(cur); free(s);
+    return w ? (int)w : BJ_OK;
+}
+
+int dc_collection_recover(dc_collection *c, const bj_io *journal) {
+    if (!journal) { c->has_journal = 0; return BJ_OK; }
+    c->journal = *journal;
+    c->has_journal = 1;
+    if (c->index_count == 0) return BJ_OK;
+    uint32_t n = dctj_file_count(c);
+    uint64_t txn[2];
+    uint64_t *lens = (uint64_t *)malloc(2 * n * sizeof(uint64_t));
+    if (!lens) return BJ_ERR_OOM;
+    int cnt = dctj_read(&c->journal, n, txn, lens);
+    if (cnt <= 0) { free(lens); return cnt; } /* 0: empty journal, adopt as-is */
+    uint64_t *cur = (uint64_t *)malloc(n * sizeof(uint64_t));
+    if (!cur) { free(lens); return BJ_ERR_OOM; }
+    dctj_gather_lens(c, cur);
+    int e = BJ_ERR_STATE;
+    for (int slot = 0; slot < cnt; slot++) {
+        uint64_t *want = lens + (size_t)slot * n;
+        int ok = 1;
+        for (uint32_t i = 0; i < n; i++) if (cur[i] < want[i]) { ok = 0; break; }
+        if (!ok) continue;
+        e = dctj_rewind_all(c, want);
+        break;
+    }
+    free(lens); free(cur);
+    return e;
 }
 
 /* Defined in the index-maintenance section below; forward-declared here so
@@ -194,7 +384,15 @@ int dc_collection_add_text_index(dc_collection *c, const char *name, int name_le
                                  const char *field, int field_len) {
     int e = dc_collection_attach_text_index(c, name, name_len, tix_index, tix_doc_terms, tix_doc_lengths, field, field_len);
     if (e) return e;
-    return backfill_index(c, name, name_len);
+    e = backfill_index(c, name, name_len);
+    if (e) return e; /* backfill_index already unregistered ix on failure */
+    /* Index count changed -- reset the journal (see the journal section
+     * above) so a stale slot from before this index existed can never be
+     * misread; roll the index back off if we can't (matches backfill's own
+     * failure-rollback convention). */
+    e = dctj_truncate(c);
+    if (e) { dc_collection_remove_index(c, name, name_len); return e; }
+    return BJ_OK;
 }
 
 int dc_collection_attach_geo_index(dc_collection *c, const char *name, int name_len,
@@ -222,7 +420,11 @@ int dc_collection_add_geo_index(dc_collection *c, const char *name, int name_len
                                 rtree *rt, const char *field, int field_len) {
     int e = dc_collection_attach_geo_index(c, name, name_len, rt, field, field_len);
     if (e) return e;
-    return backfill_index(c, name, name_len);
+    e = backfill_index(c, name, name_len);
+    if (e) return e; /* backfill_index already unregistered ix on failure */
+    e = dctj_truncate(c);
+    if (e) { dc_collection_remove_index(c, name, name_len); return e; }
+    return BJ_OK;
 }
 
 int dc_collection_remove_index(dc_collection *c, const char *name, int name_len) {
@@ -232,6 +434,11 @@ int dc_collection_remove_index(dc_collection *c, const char *name, int name_len)
             free_index(&c->indexes[i]);
             for (uint32_t j = i; j + 1 < c->index_count; j++) c->indexes[j] = c->indexes[j + 1];
             c->index_count--;
+            /* Index count changed -- reset the journal. Best-effort: a
+             * failure here just falls back to the count-mismatch self-
+             * healing check next commit (see the journal section above),
+             * not worth failing an otherwise-successful removal over. */
+            dctj_truncate(c);
             return BJ_OK;
         }
     }
@@ -478,7 +685,11 @@ int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
                             const uint8_t *fields, uint32_t fields_len) {
     int e = dc_collection_attach_index(c, name, name_len, index_tree, fields, fields_len);
     if (e) return e;
-    return backfill_index(c, name, name_len);
+    e = backfill_index(c, name, name_len);
+    if (e) return e; /* backfill_index already unregistered ix on failure */
+    e = dctj_truncate(c);
+    if (e) { dc_collection_remove_index(c, name, name_len); return e; }
+    return BJ_OK;
 }
 
 int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len,
@@ -1058,7 +1269,9 @@ int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
     if (found) return DC_ERR_DUPLICATE;
     e = bpt_add(c->primary, &key, doc, doc_len);
     if (e) return e;
-    return add_to_indexes(c, doc, doc_len, id);
+    e = add_to_indexes(c, doc, doc_len, id);
+    if (e) return e;
+    return commit_journal(c);
 }
 
 int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
@@ -1256,6 +1469,8 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
     e = bpt_delete(c->primary, &key);
     free(doc);
     if (e) return e;
+    e = commit_journal(c);
+    if (e) return e;
     *deleted = 1;
     return BJ_OK;
 }
@@ -1352,6 +1567,7 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     bpt_key key; oid_key(existing_id, &key);
     e = bpt_add(c->primary, &key, spliced, (uint32_t)spliced_len);
     if (!e) e = add_to_indexes(c, spliced, (uint32_t)spliced_len, existing_id);
+    if (!e) e = commit_journal(c);
     free(spliced);
     if (e) return e;
     *result = 1;
@@ -1447,6 +1663,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     bpt_key key; oid_key(id, &key);
     e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
     if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
+    if (!e) e = commit_journal(c);
     free(updated);
     if (e) return e;
     *result = 1;
@@ -1561,6 +1778,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                 e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
             }
             if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
+            if (!e) e = commit_journal(c);
             free(updated);
         }
     }

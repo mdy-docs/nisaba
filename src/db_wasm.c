@@ -16,6 +16,7 @@
  */
 #include "db.h"
 #include "dbuf.h"
+#include "hostio.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -43,6 +44,16 @@ EMSCRIPTEN_KEEPALIVE dc_collection *dcw_collection_open(bpt *primary) {
 }
 EMSCRIPTEN_KEEPALIVE void dcw_collection_free(dc_collection *c) {
     dc_collection_free(c);
+}
+
+/* Enable the collection's cross-file commit journal and reconcile it against
+ * the primary tree + every currently attached index (call once, after every
+ * attach_* call for this collection). `jfd < 0` disables journaling. Mirrors
+ * tixw_recover in textindex_wasm.c. */
+EMSCRIPTEN_KEEPALIVE int dcw_collection_recover(dc_collection *c, int jfd) {
+    if (jfd < 0) return dc_collection_recover(c, NULL);
+    bj_io jio = bjio_host(jfd);
+    return dc_collection_recover(c, &jio);
 }
 
 EMSCRIPTEN_KEEPALIVE int dcw_collection_attach_index(dc_collection *c,
