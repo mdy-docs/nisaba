@@ -1,4 +1,8 @@
-# nisaba
+# Nisaba
+
+> Nisaba (pronunciation: nee-SAH-bah)
+> 
+> Nisaba was the Sumerian goddess of writing, grain, and accounting — one of the oldest deities associated with record keeping and scribes. She was often depicted with a stylus and clay tablet, and scribes would invoke her name at the end of texts as a mark of accuracy and completeness.
 
 A WASM/C, MongoDB-driver-shaped embedded document database: CRUD,
 operator-aware query matching, `$regex` (ECMAScript-flavored, via
