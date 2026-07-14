@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Document DB change streams (watch()) — multi-tab demo</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 { color: #333; font-size: 20px; }
+    p.sub { color: #666; margin-top: -8px; }
+    .badge {
+      display: inline-block;
+      background: #007bff;
+      color: white;
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-family: 'Courier New', monospace;
+    }
+    .container {
+      background: white;
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    form { display: flex; gap: 10px; margin-bottom: 16px; }
+    input[type="text"] {
+      flex: 1;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #0056b3; }
+    button.danger { background: #b02a37; padding: 4px 10px; font-size: 12px; }
+    button.danger:hover { background: #8b1f29; }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #eee;
+    }
+    li:last-child { border-bottom: none; }
+    li .when { color: #999; font-size: 11px; margin-right: auto; padding-left: 10px; }
+    .empty { color: #999; padding: 10px 12px; font-style: italic; }
+    .status { color: #999; font-size: 12px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Change streams (watch()) — multi-tab demo</h1>
+  <p class="sub">
+    This tab: <span class="badge" id="tabId">...</span> —
+    open this same page in another tab or window; every insert/delete
+    below shows up live in both, via <code>collection.watch()</code>
+    across <code>db-coordinator.js</code>'s shared leader tab.
+  </p>
+
+  <div class="container">
+    <form id="addForm">
+      <input type="text" id="text" placeholder="Add a note..." autocomplete="off">
+      <button type="submit">Add</button>
+    </form>
+    <ul id="list"></ul>
+    <div class="status" id="status">Connecting...</div>
+  </div>
+
+  <script type="module">
+    // Pure JS, not the WASM build: this runs on the main thread, which never
+    // calls ready() (only public/db-worker.js does) -- these calls are just
+    // for marshaling postMessage payloads to/from the worker, not touching
+    // WASM memory directly, so the WASM-free codec is both correct and the
+    // right choice (no needless WASM instantiation on the main thread).
+    import { encode, decode, ObjectId, Pointer } from '../third_party/binjson/js/binjson.js';
+
+    const worker = new Worker('./db-worker.js', { type: 'module' });
+    let nextId = 1;
+    const pending = new Map();
+
+    worker.addEventListener('message', (event) => {
+      const { id, ok, result, error, change, rpcResult } = event.data;
+      if (change !== undefined) {
+        onChange(decode(change));
+        return;
+      }
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      if (!ok) { p.reject(new Error(error)); return; }
+      if (rpcResult) {
+        p.resolve(rpcResult.kind === 'handle' ? makeProxy(rpcResult.handleId) : decode(rpcResult.valuePayload));
+      } else {
+        p.resolve(decode(result));
+      }
+    });
+
+    function call(cmd, args = []) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ id, cmd, argsPayload: encode(args) });
+      });
+    }
+
+    // --- Generic console bridge: window.client, backed by db-worker.js's
+    // generic RPC handler (rpcInvoke). Every property access on a proxy
+    // returns a function; calling it does one postMessage round trip and
+    // resolves to either plain decoded data or another proxy (when the
+    // real call returned a live Client/Db/Collection/cursor/ChangeStream --
+    // see isRemoteHandle in db-worker.js). That means every call is async
+    // even where the real in-process API is synchronous (e.g. find(), or a
+    // cursor's .sort()/.limit()) -- always `await`. `'client'` is the
+    // plain multi-database Client itself, reserved by db-worker.js -- see
+    // its own header comment for why this deliberately isn't the same
+    // connection the notes UI below uses (this bridge has no window.db;
+    // the multi-tab-shared notes database isn't exposed to the console,
+    // only driven internally by this page's own form/list UI).
+    //
+    // Symbol.asyncIterator is special-cased to materialize via one
+    // toArray() call rather than proxying .next() one round trip per
+    // document -- works uniformly across every remote cursor shape this
+    // bridge might hand back, whether or not it implements streaming
+    // .next() internally.
+    //
+    // Not supported through this bridge: passing callbacks (e.g.
+    // `.on('change', cb)`) -- functions can't cross the postMessage
+    // boundary. Use `for await (const change of await coll.watch())`
+    // instead, or watch the page's own UI update.
+    function makeProxy(handleId) {
+      return new Proxy(() => {}, {
+        get(_target, prop) {
+          if (prop === 'then' || prop === 'catch' || prop === 'finally') return undefined;
+          if (prop === Symbol.asyncIterator) {
+            return () => {
+              let items = null, idx = 0;
+              return {
+                async next() {
+                  if (items === null) items = await rpcCall(handleId, 'toArray', []);
+                  return idx < items.length ? { value: items[idx++], done: false } : { value: undefined, done: true };
+                }
+              };
+            };
+          }
+          if (typeof prop === 'symbol') return undefined;
+          return (...args) => rpcCall(handleId, prop, args);
+        }
+      });
+    }
+
+    function rpcCall(handleId, method, args) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ id, rpc: true, handle: handleId, method, argsPayload: encode(args) });
+      });
+    }
+
+    window.client = makeProxy('client');
+    window.ObjectId = ObjectId;
+    window.Pointer = Pointer;
+    console.log(
+      '%cdb console bridge ready.%c window.client.db(name) opens its own OPFS subfolder ' +
+      "(see this project's README, \"Usage\") -- separate from this " +
+      'page\'s own shared, multi-tab notes database, which the console can\'t reach. Try:\n' +
+      "  const app = await client.db('app').then(d => d.collection('users'))\n" +
+      "  const analytics = await client.db('analytics').then(d => d.collection('users'))\n" +
+      "  await app.insertOne({ name: 'Ada' })\n" +
+      '  await analytics.find({}).then(c => c.toArray())  // -- empty, a different database entirely\n' +
+      '  for await (const doc of await app.find({})) console.log(doc)',
+      'font-weight: bold', 'font-weight: normal'
+    );
+
+    document.getElementById('tabId').textContent = Math.random().toString(36).slice(2, 8);
+
+    function render(notes) {
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      if (notes.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'empty';
+        li.textContent = 'No notes yet -- add one above.';
+        list.appendChild(li);
+        return;
+      }
+      // Newest first: ObjectId bytes are chronologically ordered, but
+      // sorting by _id server-side isn't supported (db_query.h's ordering
+      // only covers number/string/Date) -- reversing client-side is free.
+      for (const note of [...notes].reverse()) {
+        const li = document.createElement('li');
+        const span = document.createElement('span');
+        span.textContent = note.text;
+        const del = document.createElement('button');
+        del.textContent = 'Delete';
+        del.className = 'danger';
+        del.addEventListener('click', () => call('deleteOne', [note._id]));
+        li.append(span, del);
+        list.appendChild(li);
+      }
+    }
+
+    async function refresh() {
+      render(await call('find'));
+    }
+
+    // Simplest and most robust for a demo: any change re-fetches the whole
+    // list rather than trying to patch the DOM incrementally per event.
+    function onChange(change) {
+      document.getElementById('status').textContent =
+        `Last change: ${change.operationType} @ ${new Date().toLocaleTimeString()}`;
+      refresh();
+    }
+
+    document.getElementById('addForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('text');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      await call('insertOne', [{ text }]);
+    });
+
+    await call('watch');
+    await refresh();
+    document.getElementById('status').textContent = 'Connected -- watching for changes.';
+  </script>
+</body>
+</html>
