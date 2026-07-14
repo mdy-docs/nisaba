@@ -11,7 +11,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 // Pure JS, not the WASM build: this runs on the main test thread, which
 // never calls ready() -- only test/db-coordinator-harness.js's Worker does
-// -- same reasoning as public/db.html's own import of these two.
+// -- same reasoning as index.html's own import of these two.
 import { encode, decode } from '../third_party/binjson/js/binjson.js';
 
 let counter = 0;

@@ -13,7 +13,7 @@
  *
  * This module must run somewhere with `navigator.locks`/`BroadcastChannel`
  * — a dedicated Worker, matching the existing constraint that OPFS access
- * itself already requires a Worker (see README.md, public/worker.js). Every
+ * itself already requires a Worker (see README.md, src/db-worker.js). Every
  * tab already needs its own worker for OPFS regardless of this feature, so
  * the whole coordinator — election, RPC, and the real Db — lives inside
  * that worker; the tab's main thread is unaware any of this exists and
@@ -41,7 +41,7 @@
  * this; the only structural difference is `find()`'s cursor resolving with
  * one RPC call on `.toArray()`, matching the real cursor's own laziness.
  */
-import { encode, decode, connect, ChangeStream } from './wasm/nisaba-wasm.js';
+import { encode, decode, connect, ChangeStream } from '../wasm/nisaba-wasm.js';
 
 const REQUEST_TIMEOUT_MS = 5000;
 const REELECT_WAIT_MS = 2000;

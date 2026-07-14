@@ -3,21 +3,17 @@
   "version": "1.0.0",
   "description": "A WASM/C, MongoDB-driver-shaped embedded document database (CRUD, query operators, $regex, secondary/geo/text indexes, change streams), built on binjson and binjson-structures",
   "type": "module",
-  "main": "db.js",
+  "main": "src/db.js",
   "exports": {
-    ".": "./db.js",
+    ".": "./src/db.js",
     "./wasm": "./wasm/nisaba-wasm.js",
-    "./coordinator": "./db-coordinator.js"
+    "./coordinator": "./src/db-coordinator.js"
   },
   "files": [
     "wasm",
-    "src",
-    "include",
-    "lib",
     "bin",
-    "public",
-    "db.js",
-    "db-coordinator.js"
+    "src",
+    "index.html"
   ],
   "bin": {
     "db": "bin/db.js"
@@ -26,8 +22,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.js",
-    "build:wasm": "./build-wasm.sh",
-    "prepack": "npm run build:wasm"
+    "build:wasm": "./wasm/build-wasm.sh",
+    "prepack": "npm run build:wasm",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "keywords": [
     "database",
@@ -44,6 +43,7 @@
     "@vitest/browser": "^3.2.4",
     "node-opfs": "^1.2.0",
     "playwright": "^1.49.1",
+    "vite": "^7.3.6",
     "vitest": "^3.2.4"
   },
   "allowScripts": {

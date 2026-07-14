@@ -1,4 +1,6 @@
-lib/
+wasm/lib/
+dist/
+.vite/
 *.o
 node_modules/
 package-lock.json

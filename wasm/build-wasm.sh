@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the standalone nisaba WASM module: lib/nisaba.wasm +
-# lib/nisaba.wasm.mjs (the ES module loader), loaded by
+# Build the standalone nisaba WASM module: wasm/lib/nisaba.wasm +
+# wasm/lib/nisaba.wasm.mjs (the ES module loader), loaded by
 # wasm/nisaba-wasm.js. Mirrors the parent project's c/build-wasm.sh (same
 # flags, same combined-binary shape) but links only this package's own
 # sources plus its nested binjson/binjson-structures/regex-engine
@@ -9,8 +9,8 @@
 # (`git submodule update --init`).
 set -euo pipefail
 
-cd "$(dirname "$0")"
-mkdir -p lib
+cd "$(dirname "$0")/.."
+mkdir -p wasm/lib
 
 for dep in binjson binjson-structures regex-engine; do
   if [ ! -d "third_party/$dep/include" ] && [ ! -d "third_party/$dep/src" ]; then
@@ -26,7 +26,7 @@ done
 COMMON_FLAGS=(
   -O3
   -flto
-  -Iinclude
+  -Iwasm/include
   -Ithird_party/binjson/include
   -Ithird_party/binjson-structures/include
   -Ithird_party/regex-engine/include
@@ -92,14 +92,14 @@ SOURCES=(
   third_party/binjson-structures/src/diff.c third_party/binjson-structures/src/textlog.c third_party/binjson-structures/src/textlog_wasm.c
   third_party/binjson-structures/src/stemmer.c third_party/binjson-structures/src/textindex.c third_party/binjson-structures/src/textindex_wasm.c
   third_party/regex-engine/src/regexp.c third_party/regex-engine/src/regex_wasm.c
-  src/db_keyenc.c src/regex.c src/db_query.c src/db_update.c src/db.c src/db_wasm.c
+  wasm/src/db_keyenc.c wasm/src/regex.c wasm/src/db_query.c wasm/src/db_update.c wasm/src/db.c wasm/src/db_wasm.c
 )
 
 emcc "${SOURCES[@]}" \
   "${COMMON_FLAGS[@]}" \
   -sEXPORT_NAME=createNisabaModule \
   -sEXPORTED_FUNCTIONS="$EXPORTS" \
-  -o lib/nisaba.mjs
+  -o wasm/lib/nisaba.mjs
 
-mv lib/nisaba.mjs lib/nisaba.wasm.mjs
-echo "built lib/nisaba.wasm.mjs ($(wc -c < lib/nisaba.wasm) bytes wasm)"
+mv wasm/lib/nisaba.mjs wasm/lib/nisaba.wasm.mjs
+echo "built wasm/lib/nisaba.wasm.mjs ($(wc -c < wasm/lib/nisaba.wasm) bytes wasm)"

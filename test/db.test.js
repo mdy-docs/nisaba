@@ -6,7 +6,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ready } from '../wasm/nisaba-wasm.js';
 import { ObjectId } from '../wasm/nisaba-wasm.js';
-import { connect, MemoryStorageProvider, OPFSStorageProvider } from '../db.js';
+import { connect, MemoryStorageProvider, OPFSStorageProvider } from '../src/db.js';
 import { bootstrapOPFS } from './binjson.suite.js';
 
 await ready();

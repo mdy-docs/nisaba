@@ -14,7 +14,7 @@ format and value types) and
 [binjson-structures](https://github.com/mdy-docs/binjson-structures)
 (the B+ tree primary store and secondary equality index, R-tree for geo
 indexes, text index for `$text`-style search) — `nisaba`'s own C code
-(`db.c`/`db_query.c`/`db_update.c`/`db_keyenc.c`/`db_wasm.c`, plus
+(`wasm/src/db.c`/`db_query.c`/`db_update.c`/`db_keyenc.c`/`db_wasm.c`, plus
 `regex.c` as the `$regex` adapter over regex-engine) is the CRUD/query/
 update layer built on top of those, not a data structure itself.
 
@@ -49,7 +49,7 @@ same binary.
 
 ```
 git submodule update --init
-./build-wasm.sh
+./wasm/build-wasm.sh
 ```
 
 ## Usage

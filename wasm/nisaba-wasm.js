@@ -1,7 +1,7 @@
 /**
  * nisaba-wasm.js — standalone WASM-backed document database engine,
  * buildable and usable independently of the rest of the parent project
- * (see build-wasm.sh in this package's root).
+ * (see build-wasm.sh in this directory).
  *
  * Extracted verbatim from the parent project's src/binjson-wasm.js (its
  * own combined WASM module bundles this together with the parent's own
@@ -37,7 +37,7 @@
  * The WASM module loads asynchronously; call and await `ready()` once
  * before using any of these synchronously-shaped APIs.
  */
-import createModule from '../lib/nisaba.wasm.mjs';
+import createModule from './lib/nisaba.wasm.mjs';
 import {
   TYPE,
   ObjectId,

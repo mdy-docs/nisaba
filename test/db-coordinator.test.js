@@ -18,7 +18,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { ready, MemoryStorageProvider } from '../wasm/nisaba-wasm.js';
-import { connectShared } from '../db-coordinator.js';
+import { connectShared } from '../src/db-coordinator.js';
 
 await ready();
 

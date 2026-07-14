@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { ready } from '../wasm/nisaba-wasm.js';
-import { connect, MemoryStorageProvider } from '../db.js';
+import { connect, MemoryStorageProvider } from '../src/db.js';
 
 await ready();
 

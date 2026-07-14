@@ -1,5 +1,5 @@
 // Worker-side half of the change-streams (watch()) multi-tab demo
-// (public/db.html). Runs the real document database + coordinator inside a
+// (index.html). Runs the real document database + coordinator inside a
 // dedicated Worker -- required by db-coordinator.js's own doc comment
 // (OPFS + navigator.locks + BroadcastChannel all need to run off the main
 // thread), same reasoning any other OPFS-backed demo needs to follow. This
@@ -11,7 +11,7 @@
 // So the generic console RPC bridge below has to live here too, not in
 // db.html directly.
 //
-// Every tab that opens public/db.html spins up its own instance of this
+// Every tab that opens index.html spins up its own instance of this
 // worker; connectShared('watch-demo', ...) elects exactly one of them the
 // leader (see db-coordinator.js), so all tabs share one underlying `db`
 // no matter how many are open.
@@ -24,10 +24,10 @@
 import { ready, OPFSStorageProvider, connectClient } from '../wasm/nisaba-wasm.js';
 // Pure JS, not the WASM build: the message handler's decode(argsPayload)
 // can run before ready() has ever been awaited (e.g. the very first
-// message this worker receives) -- same reasoning as db.html's own
+// message this worker receives) -- same reasoning as index.html's own
 // import of these two.
 import { encode, decode } from '../third_party/binjson/js/binjson.js';
-import { connectShared } from '../db-coordinator.js';
+import { connectShared } from './db-coordinator.js';
 
 let db = null;
 let notes = null;

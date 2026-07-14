@@ -14,7 +14,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { ready } from '../wasm/nisaba-wasm.js';
 import { ObjectId } from '../wasm/nisaba-wasm.js';
-import { connect, OPFSStorageProvider } from '../db.js';
+import { connect, OPFSStorageProvider } from '../src/db.js';
 import { deleteFile, getFileHandle } from '../wasm/nisaba-wasm.js';
 import { bootstrapOPFS } from './binjson.suite.js';
 

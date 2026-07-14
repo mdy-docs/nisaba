@@ -18,7 +18,7 @@
 import { ready, OPFSStorageProvider } from '../wasm/nisaba-wasm.js';
 // Pure JS, not the WASM build: the message handler's decode(argsPayload)
 // runs unconditionally, including on the very first message (before
-// ready() is ever awaited) -- same reasoning as public/db-worker.js's own
+// ready() is ever awaited) -- same reasoning as src/db-worker.js's own
 // import of these two. Must be this same third_party/binjson copy that
 // nisaba-wasm.js itself imports -- nisaba-wasm.js's internal encode() does
 // `instanceof ObjectId` against its own ObjectId class; decoding an _id
@@ -27,7 +27,7 @@ import { ready, OPFSStorageProvider } from '../wasm/nisaba-wasm.js';
 // fail and the _id gets encoded as a plain object instead of an OID, so
 // findOne({_id}) never matches anything.
 import { encode, decode } from '../third_party/binjson/js/binjson.js';
-import { connectShared } from '../db-coordinator.js';
+import { connectShared } from '../src/db-coordinator.js';
 
 let sharedDb = null;
 let coordinator = null;

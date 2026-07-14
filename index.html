@@ -83,19 +83,20 @@
   </div>
 
   <script type="module">
-    // Pure JS, not the WASM build: this runs on the main thread, which never
-    // calls ready() (only public/db-worker.js does) -- these calls are just
-    // for marshaling postMessage payloads to/from the worker, not touching
-    // WASM memory directly, so the WASM-free codec is both correct and the
-    // right choice (no needless WASM instantiation on the main thread).
-    import { encode, decode, ObjectId, Pointer } from '../third_party/binjson/js/binjson.js';
+    // db.js -- this package's public entry point, exercised here exactly as
+    // any other project consuming nisaba would: the pure-JS (no WASM) codec
+    // for marshaling postMessage payloads (this thread never calls ready(),
+    // so it shouldn't pay for a WASM instantiation just to encode/decode),
+    // and createRemoteBridge for wrapping a Worker's RPC handle as a
+    // local-feeling proxy (see db.js's own doc comment for both).
+    import { encode, decode, ObjectId, Pointer, createRemoteBridge } from './src/db.js';
 
-    const worker = new Worker('./db-worker.js', { type: 'module' });
+    const worker = new Worker(new URL('./src/db-worker.js', import.meta.url), { type: 'module' });
     let nextId = 1;
     const pending = new Map();
 
     worker.addEventListener('message', (event) => {
-      const { id, ok, result, error, change, rpcResult } = event.data;
+      const { id, ok, result, error, change } = event.data;
       if (change !== undefined) {
         onChange(decode(change));
         return;
@@ -104,11 +105,7 @@
       if (!p) return;
       pending.delete(id);
       if (!ok) { p.reject(new Error(error)); return; }
-      if (rpcResult) {
-        p.resolve(rpcResult.kind === 'handle' ? makeProxy(rpcResult.handleId) : decode(rpcResult.valuePayload));
-      } else {
-        p.resolve(decode(result));
-      }
+      p.resolve(decode(result));
     });
 
     function call(cmd, args = []) {
@@ -120,70 +117,34 @@
     }
 
     // --- Generic console bridge: window.client, backed by db-worker.js's
-    // generic RPC handler (rpcInvoke). Every property access on a proxy
-    // returns a function; calling it does one postMessage round trip and
-    // resolves to either plain decoded data or another proxy (when the
-    // real call returned a live Client/Db/Collection/cursor/ChangeStream --
-    // see isRemoteHandle in db-worker.js). That means every call is async
-    // even where the real in-process API is synchronous (e.g. find(), or a
-    // cursor's .sort()/.limit()) -- always `await`. `'client'` is the
-    // plain multi-database Client itself, reserved by db-worker.js -- see
-    // its own header comment for why this deliberately isn't the same
-    // connection the notes UI below uses (this bridge has no window.db;
-    // the multi-tab-shared notes database isn't exposed to the console,
-    // only driven internally by this page's own form/list UI).
-    //
-    // Symbol.asyncIterator is special-cased to materialize via one
-    // toArray() call rather than proxying .next() one round trip per
-    // document -- works uniformly across every remote cursor shape this
-    // bridge might hand back, whether or not it implements streaming
-    // .next() internally.
-    //
-    // Not supported through this bridge: passing callbacks (e.g.
-    // `.on('change', cb)`) -- functions can't cross the postMessage
-    // boundary. Use `for await (const change of await coll.watch())`
-    // instead, or watch the page's own UI update.
-    function makeProxy(handleId) {
-      return new Proxy(() => {}, {
-        get(_target, prop) {
-          if (prop === 'then' || prop === 'catch' || prop === 'finally') return undefined;
-          if (prop === Symbol.asyncIterator) {
-            return () => {
-              let items = null, idx = 0;
-              return {
-                async next() {
-                  if (items === null) items = await rpcCall(handleId, 'toArray', []);
-                  return idx < items.length ? { value: items[idx++], done: false } : { value: undefined, done: true };
-                }
-              };
-            };
-          }
-          if (typeof prop === 'symbol') return undefined;
-          return (...args) => rpcCall(handleId, prop, args);
-        }
-      });
-    }
-
-    function rpcCall(handleId, method, args) {
-      const id = nextId++;
-      return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        worker.postMessage({ id, rpc: true, handle: handleId, method, argsPayload: encode(args) });
-      });
-    }
-
+    // generic RPC handler (rpcInvoke) via db.js's createRemoteBridge.
+    // `'client'` is the plain multi-database Client itself, reserved by
+    // db-worker.js -- see its own header comment for why this deliberately
+    // isn't the same connection the notes UI below uses (this bridge has no
+    // window.db; the multi-tab-shared notes database isn't exposed to the
+    // console, only driven internally by this page's own form/list UI).
+    const { makeProxy } = createRemoteBridge(worker);
     window.client = makeProxy('client');
     window.ObjectId = ObjectId;
     window.Pointer = Pointer;
     console.log(
       '%cdb console bridge ready.%c window.client.db(name) opens its own OPFS subfolder ' +
       "(see this project's README, \"Usage\") -- separate from this " +
-      'page\'s own shared, multi-tab notes database, which the console can\'t reach. Try:\n' +
-      "  const app = await client.db('app').then(d => d.collection('users'))\n" +
-      "  const analytics = await client.db('analytics').then(d => d.collection('users'))\n" +
-      "  await app.insertOne({ name: 'Ada' })\n" +
-      '  await analytics.find({}).then(c => c.toArray())  // -- empty, a different database entirely\n' +
-      '  for await (const doc of await app.find({})) console.log(doc)',
+      'page\'s own shared, multi-tab notes database, which the console can\'t reach. ' +
+      // Wrapped in a single unclosed-until-the-end IIFE (rather than five
+      // independent lines) so pasting the whole block is safe even in
+      // consoles that execute on every embedded newline during a paste --
+      // the open `(async () => {` means nothing can run until the matching
+      // `})();` at the end arrives, so a REPL never sees (and chokes on) a
+      // partial statement like a bare `const app`.
+      'Paste this whole block at once (it\'s one statement):\n' +
+      '(async () => {\n' +
+      "  const app = await client.db('app').then(d => d.collection('users'));\n" +
+      "  const analytics = await client.db('analytics').then(d => d.collection('users'));\n" +
+      "  await app.insertOne({ name: 'Ada' });\n" +
+      '  console.log(await analytics.find({}).then(c => c.toArray())); // -- empty, a different database entirely\n' +
+      '  for await (const doc of await app.find({})) console.log(doc);\n' +
+      '})();',
       'font-weight: bold', 'font-weight: normal'
     );
 
