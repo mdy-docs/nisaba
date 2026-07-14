@@ -1552,7 +1552,19 @@ int dc_insert_many(dc_collection *c, const uint8_t *docs, uint32_t docs_len,
     return e;
 }
 
+/* Emits a found document through out/out_len: projected if projection_len
+ * is non-zero, a plain byte copy otherwise -- shared by every match point
+ * in dc_find_one below so "project if asked, copy if not" is expressed
+ * once rather than at each of its four branches. */
+static int emit_found(const uint8_t *doc, size_t doc_len,
+                      const uint8_t *projection, uint32_t projection_len,
+                      uint8_t **out, size_t *out_len) {
+    if (projection_len) return qry_project_one(doc, doc_len, projection, projection_len, out, out_len);
+    return dbuf_dup(doc, doc_len, out, out_len);
+}
+
 int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                const uint8_t *projection, uint32_t projection_len,
                 int *found, uint8_t **out, size_t *out_len) {
     *found = 0; *out = NULL; *out_len = 0;
 
@@ -1566,7 +1578,7 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         e = bpt_search(c->primary, &key, &f, &p, &n);
         if (e || !f) return e;
         *found = 1;
-        return dbuf_dup(p, n, out, out_len);
+        return emit_found(p, n, projection, projection_len, out, out_len);
     }
 
     dc_source src;
@@ -1585,7 +1597,7 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             if (e) break;
             if (m) {
                 *found = 1;
-                e = dbuf_dup(cc.d + dstart, cc.pos - dstart, out, out_len);
+                e = emit_found(cc.d + dstart, cc.pos - dstart, projection, projection_len, out, out_len);
                 break;
             }
         }
@@ -1618,7 +1630,7 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             if (e) break;
             if (m) {
                 *found = 1;
-                e = dbuf_dup(cc.d + dstart, cc.pos - dstart, out, out_len);
+                e = emit_found(cc.d + dstart, cc.pos - dstart, projection, projection_len, out, out_len);
                 break;
             }
         }
@@ -1640,7 +1652,7 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         if (rc) break;
         if (m) {
             *found = 1;
-            rc = dbuf_dup(val, vlen, out, out_len);
+            rc = emit_found(val, vlen, projection, projection_len, out, out_len);
             break;
         }
     }
@@ -1664,10 +1676,191 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     return e;
 }
 
+/*
+ * dc_cursor -- see db.h's top comment on it. Mirrors gather_matches's own
+ * three-way dispatch (special $text/$near/$geoWithin source, else the
+ * equality-index planner, else a full scan) but keeps whichever source
+ * turned out to apply as persistent, resumable state instead of draining
+ * it into a qry_doc array before returning. scan_filter/scan_filter_len
+ * is whichever filter bytes should be re-checked against each raw
+ * candidate in this cursor's mode: the caller's full filter for the
+ * full-scan and index-planned cases (matching gather_matches's own
+ * behavior), or the special source's residual for that case (the part of
+ * the filter not already satisfied by the source) -- exactly one
+ * consistent thing to re-check regardless of which mode is active.
+ */
+typedef enum { DC_CURSOR_SCAN, DC_CURSOR_CANDIDATES } dc_cursor_mode;
+
+struct dc_cursor {
+    dc_cursor_mode mode;
+    int done;
+
+    uint8_t *scan_filter; uint32_t scan_filter_len;   /* owned */
+    uint8_t *projection; uint32_t projection_len;      /* owned; projection_len 0 = none */
+    int64_t skip_remaining;
+    int64_t limit_remaining; /* -1 = unlimited */
+
+    bpt_cursor *bpt_cur; /* DC_CURSOR_SCAN only */
+
+    uint8_t *cand; size_t cand_len; /* DC_CURSOR_CANDIDATES only: owned binjson ARRAY */
+    cur cand_walk;                  /* resumable walk state over `cand` */
+    uint32_t cand_count, cand_seen;
+};
+
+void dc_cursor_close(dc_cursor *dcur) {
+    if (!dcur) return;
+    if (dcur->bpt_cur) bpt_cursor_close(dcur->bpt_cur);
+    free(dcur->cand);
+    free(dcur->scan_filter);
+    free(dcur->projection);
+    free(dcur);
+}
+
+/* Releases just the underlying scan resource once exhausted -- the cursor struct itself lives until dc_cursor_close. */
+static void dc_cursor_release_scan(dc_cursor *dcur) {
+    if (dcur->bpt_cur) { bpt_cursor_close(dcur->bpt_cur); dcur->bpt_cur = NULL; }
+    free(dcur->cand); dcur->cand = NULL;
+}
+
+int dc_cursor_open(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                   const uint8_t *projection, uint32_t projection_len,
+                   int64_t skip, int64_t limit, dc_cursor **out_cursor) {
+    *out_cursor = NULL;
+
+    dc_cursor *dcur = (dc_cursor *)calloc(1, sizeof(dc_cursor));
+    if (!dcur) return BJ_ERR_OOM;
+    dcur->skip_remaining = skip > 0 ? skip : 0;
+    dcur->limit_remaining = limit > 0 ? limit : -1;
+
+    if (projection_len) {
+        dcur->projection = (uint8_t *)malloc(projection_len);
+        if (!dcur->projection) { dc_cursor_close(dcur); return BJ_ERR_OOM; }
+        memcpy(dcur->projection, projection, projection_len);
+        dcur->projection_len = projection_len;
+    }
+
+    dc_source src;
+    int e = resolve_special_source(c, filter, filter_len, &src);
+    if (e) { dc_source_free(&src); dc_cursor_close(dcur); return e; }
+
+    if (src.use_index) {
+        dcur->mode = DC_CURSOR_CANDIDATES;
+        dcur->cand = src.cand; dcur->cand_len = src.cand_len; src.cand = NULL;
+        dcur->scan_filter = src.residual; dcur->scan_filter_len = (uint32_t)src.residual_len; src.residual = NULL;
+        dc_source_free(&src); /* no-op now: both owned fields already taken */
+
+        dcur->cand_walk = (cur){ dcur->cand, dcur->cand_len, 0 };
+        e = array_begin(&dcur->cand_walk, &dcur->cand_count);
+        if (e) { dc_cursor_close(dcur); return e; }
+        *out_cursor = dcur;
+        return BJ_OK;
+    }
+    dc_source_free(&src);
+
+    dc_index *ix = NULL; uint8_t *ix_values = NULL; size_t ix_values_len = 0;
+    int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &ix_values, &ix_values_len, &planned);
+    if (e) { dc_cursor_close(dcur); return e; }
+
+    dcur->scan_filter = (uint8_t *)malloc(filter_len ? filter_len : 1);
+    if (!dcur->scan_filter) { free(ix_values); dc_cursor_close(dcur); return BJ_ERR_OOM; }
+    memcpy(dcur->scan_filter, filter, filter_len);
+    dcur->scan_filter_len = filter_len;
+
+    if (planned) {
+        uint8_t *cand = NULL; size_t cand_len = 0;
+        e = dc_collection_find_by_index(c, ix->name, (int)ix->name_len,
+                                        ix_values, (uint32_t)ix_values_len, &cand, &cand_len);
+        free(ix_values);
+        if (e) { free(cand); dc_cursor_close(dcur); return e; }
+
+        dcur->mode = DC_CURSOR_CANDIDATES;
+        dcur->cand = cand; dcur->cand_len = cand_len;
+        dcur->cand_walk = (cur){ dcur->cand, dcur->cand_len, 0 };
+        e = array_begin(&dcur->cand_walk, &dcur->cand_count);
+        if (e) { dc_cursor_close(dcur); return e; }
+        *out_cursor = dcur;
+        return BJ_OK;
+    }
+    free(ix_values);
+
+    dcur->mode = DC_CURSOR_SCAN;
+    dcur->bpt_cur = bpt_cursor_open(c->primary, NULL, NULL);
+    if (!dcur->bpt_cur) { dc_cursor_close(dcur); return BJ_ERR_OOM; }
+    *out_cursor = dcur;
+    return BJ_OK;
+}
+
+/* Next raw candidate document from whichever source is active: 1 with val/vlen set, 0 at end, <0 on error. */
+static int dc_cursor_pull(dc_cursor *dcur, const uint8_t **val, size_t *vlen) {
+    if (dcur->mode == DC_CURSOR_SCAN) {
+        bpt_key k;
+        return bpt_cursor_next(dcur->bpt_cur, &k, val, vlen);
+    }
+    if (dcur->cand_seen >= dcur->cand_count) return 0;
+    size_t dstart = dcur->cand_walk.pos;
+    int e = skip_value(&dcur->cand_walk);
+    if (e) return e;
+    *val = dcur->cand_walk.d + dstart;
+    *vlen = dcur->cand_walk.pos - dstart;
+    dcur->cand_seen++;
+    return 1;
+}
+
+int dc_cursor_next_batch(dc_cursor *dcur, uint32_t max_count,
+                         uint8_t **out, size_t *out_len, int *out_done) {
+    *out = NULL; *out_len = 0;
+    if (dcur->done) { *out_done = 1; return BJ_OK; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+
+    uint32_t collected = 0;
+    while (!e && collected < max_count) {
+        const uint8_t *val; size_t vlen;
+        int r = dc_cursor_pull(dcur, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) { dcur->done = 1; break; }
+
+        int m = 0;
+        e = qry_matches(val, vlen, dcur->scan_filter, dcur->scan_filter_len, &m);
+        if (e) break;
+        if (!m) continue;
+
+        if (dcur->skip_remaining > 0) { dcur->skip_remaining--; continue; }
+
+        if (dcur->projection_len) {
+            uint8_t *pj = NULL; size_t pjlen = 0;
+            e = qry_project_one(val, vlen, dcur->projection, dcur->projection_len, &pj, &pjlen);
+            if (!e) e = bj_put_raw(b, pj, (uint32_t)pjlen);
+            free(pj);
+        } else {
+            e = bj_put_raw(b, val, (uint32_t)vlen);
+        }
+        if (e) break;
+        collected++;
+
+        if (dcur->limit_remaining > 0 && --dcur->limit_remaining == 0) { dcur->done = 1; break; }
+    }
+
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        size_t n; const uint8_t *p = bj_builder_data(b, &n);
+        if (!p) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_dup(p, n, out, out_len);
+    }
+    bj_builder_free(b);
+
+    if (dcur->done) dc_cursor_release_scan(dcur);
+    *out_done = dcur->done;
+    return e;
+}
+
 int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, int *deleted) {
     *deleted = 0;
     int found = 0; uint8_t *doc = NULL; size_t doc_len = 0;
-    int e = dc_find_one(c, filter, filter_len, &found, &doc, &doc_len);
+    int e = dc_find_one(c, filter, filter_len, NULL, 0, &found, &doc, &doc_len);
     if (e) { free(doc); return e; }
     if (!found) { free(doc); return BJ_OK; }
 
@@ -1713,7 +1906,7 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
                            int *found, uint8_t **out, size_t *out_len) {
     *found = 0; *out = NULL; *out_len = 0;
     int f = 0; uint8_t *doc = NULL; size_t doc_len = 0;
-    int e = dc_find_one(c, filter, filter_len, &f, &doc, &doc_len);
+    int e = dc_find_one(c, filter, filter_len, NULL, 0, &f, &doc, &doc_len);
     if (e) { free(doc); return e; }
     if (!f) { free(doc); return BJ_OK; }
 
@@ -1787,7 +1980,7 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     }
 
     int found = 0; uint8_t *doc = NULL; size_t doc_len = 0;
-    int e = dc_find_one(c, filter, filter_len, &found, &doc, &doc_len);
+    int e = dc_find_one(c, filter, filter_len, NULL, 0, &found, &doc, &doc_len);
     if (e) { free(doc); return e; }
 
     if (!found) {
@@ -1844,7 +2037,7 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
     *found = 0; *out = NULL; *out_len = 0;
 
     int before_found = 0; uint8_t *before = NULL; size_t before_len = 0;
-    int e = dc_find_one(c, filter, filter_len, &before_found, &before, &before_len);
+    int e = dc_find_one(c, filter, filter_len, NULL, 0, &before_found, &before, &before_len);
     if (e) { free(before); return e; }
     if (!before_found && !upsert) { free(before); return BJ_OK; }
 
@@ -1872,7 +2065,7 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
     uint8_t *idfilter2 = NULL; size_t idfilter2_len = 0;
     e = build_id_filter(target_id, &idfilter2, &idfilter2_len);
     if (e) return e;
-    e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, found, out, out_len);
+    e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, NULL, 0, found, out, out_len);
     free(idfilter2);
     return e;
 }
@@ -1928,7 +2121,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     if (e) return e;
 
     int found = 0; uint8_t *doc = NULL; size_t doc_len = 0;
-    e = dc_find_one(c, filter, filter_len, &found, &doc, &doc_len);
+    e = dc_find_one(c, filter, filter_len, NULL, 0, &found, &doc, &doc_len);
     if (e) { free(doc); return e; }
 
     if (!found) {
@@ -1986,7 +2179,7 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
     if (e) return e;
 
     int before_found = 0; uint8_t *before = NULL; size_t before_len = 0;
-    e = dc_find_one(c, filter, filter_len, &before_found, &before, &before_len);
+    e = dc_find_one(c, filter, filter_len, NULL, 0, &before_found, &before, &before_len);
     if (e) { free(before); return e; }
     if (!before_found && !upsert) { free(before); return BJ_OK; }
 
@@ -2016,7 +2209,7 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
     uint8_t *idfilter2 = NULL; size_t idfilter2_len = 0;
     e = build_id_filter(target_id, &idfilter2, &idfilter2_len);
     if (e) return e;
-    e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, found, out, out_len);
+    e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, NULL, 0, found, out, out_len);
     free(idfilter2);
     return e;
 }

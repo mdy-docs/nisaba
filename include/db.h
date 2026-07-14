@@ -254,12 +254,15 @@ int dc_insert_many(dc_collection *c, const uint8_t *docs, uint32_t docs_len,
 
 /*
  * First document matching `filter` (a binjson OBJECT; {} matches every
- * document). *found is 1/0; when found, writes a freshly malloc'd copy of
- * the document through *out / *out_len (caller frees). filter == {_id:
- * <oid>} is always an O(log n) bpt_search; otherwise see db.h's top
- * comment for when an attached index is used.
+ * document), with `projection` (may be NULL/0 for none, same shape as
+ * dc_find/dc_cursor_open's) applied to it. *found is 1/0; when found,
+ * writes a freshly malloc'd copy of the (projected, if requested)
+ * document through *out / *out_len (caller frees). filter == {_id: <oid>}
+ * is always an O(log n) bpt_search; otherwise see db.h's top comment for
+ * when an attached index is used.
  */
 int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                const uint8_t *projection, uint32_t projection_len,
                 int *found, uint8_t **out, size_t *out_len);
 
 /*
@@ -270,6 +273,55 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
  */
 int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             const qry_options *opts, uint8_t **out, size_t *out_len);
+
+/*
+ * A resumable, bounded-memory cursor over documents matching `filter`
+ * (opened via dc_cursor_open, advanced in batches via
+ * dc_cursor_next_batch, released via dc_cursor_close). Unlike dc_find,
+ * this does not materialize every match up front -- opaque, defined in
+ * db.c.
+ *
+ * No sort support: an arbitrary in-memory sort fundamentally needs every
+ * match before it can emit the first ordered result (the same reason
+ * unindexed sorts in most databases carry a buffered-sort memory
+ * ceiling). Callers needing a sorted result should use dc_find instead.
+ *
+ * Not safe across a concurrent compact() on the same collection while
+ * the cursor is open -- compaction can rewrite the file the cursor's
+ * underlying B+ tree scan is positioned against. Fine for the
+ * within-one-request lifetime dc_find already has; a cursor meant to
+ * outlive a single request (paged over multiple separate calls, as the
+ * cloud service's REST cursor protocol does) needs the caller to keep
+ * that window short or avoid compacting a collection with cursors open
+ * against it -- not enforced at this layer today.
+ */
+typedef struct dc_cursor dc_cursor;
+
+/*
+ * Open a cursor over every document in `c` matching `filter`, with
+ * `projection` (may be NULL/0) applied to each returned document.
+ * `skip`/`limit` (0 = none/unlimited, matching qry_options's convention)
+ * are honored incrementally as the cursor advances rather than up front.
+ */
+int dc_cursor_open(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+                   const uint8_t *projection, uint32_t projection_len,
+                   int64_t skip, int64_t limit, dc_cursor **out_cursor);
+
+/*
+ * Advance the cursor, collecting up to `max_count` further matching
+ * documents (each already projected) into a freshly built binjson ARRAY
+ * through *out / *out_len (caller frees). *out_done is set to 1 once the
+ * underlying source is exhausted or the cursor's limit has been reached
+ * -- the cursor releases its underlying scan resources at that point
+ * (safe to still call dc_cursor_close afterward; also safe to call
+ * dc_cursor_next_batch again on an already-done cursor, a no-op
+ * returning an empty array with *out_done still 1).
+ */
+int dc_cursor_next_batch(dc_cursor *cur, uint32_t max_count,
+                         uint8_t **out, size_t *out_len, int *out_done);
+
+/* Release a cursor's resources. Safe to pass NULL. */
+void dc_cursor_close(dc_cursor *cur);
 
 /* Delete the first document matching `filter`, from the primary tree and
  * every attached index. *deleted is 1/0. */

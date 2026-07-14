@@ -124,12 +124,18 @@ EMSCRIPTEN_KEEPALIVE int dcw_insert_many(dcw_out *o, dc_collection *c,
     return dc_insert_many(c, docs, (uint32_t)docs_len, ordered, &o->buf, &o->len);
 }
 
-/* Returns 1 if found (document in the out slot), 0 if not, negative on error. */
+/* `projection` may be NULL (with length 0) for "none", same convention as
+ * dcw_find's. Returns 1 if found (document in the out slot), 0 if not,
+ * negative on error. */
 EMSCRIPTEN_KEEPALIVE int dcw_find_one(dcw_out *o, dc_collection *c,
-                                      const uint8_t *filter, int filter_len) {
+                                      const uint8_t *filter, int filter_len,
+                                      const uint8_t *projection, int projection_len) {
     reset_out(o);
     int found = 0;
-    int e = dc_find_one(c, filter, (uint32_t)filter_len, &found, &o->buf, &o->len);
+    int e = dc_find_one(c, filter, (uint32_t)filter_len,
+                        projection_len > 0 ? projection : NULL,
+                        projection_len > 0 ? (uint32_t)projection_len : 0,
+                        &found, &o->buf, &o->len);
     if (e) return e;
     return found ? 1 : 0;
 }
@@ -151,6 +157,42 @@ EMSCRIPTEN_KEEPALIVE int dcw_find(dcw_out *o, dc_collection *c,
     opts.projection = projection_len > 0 ? projection : NULL;
     opts.projection_len = projection_len > 0 ? (uint32_t)projection_len : 0;
     return dc_find(c, filter, (uint32_t)filter_len, &opts, &o->buf, &o->len);
+}
+
+/*
+ * Resumable cursor over dc_find's same match set, minus sort support (see
+ * db.h's dc_cursor comment) -- lets JS pull results in bounded-memory
+ * batches across multiple separate calls instead of dc_find's single
+ * fully-materializing one. skip/limit/projection follow dcw_find's own
+ * bridge conventions (0/NULL = none). Returns NULL on failure, with the
+ * specific error code written through *err_out -- unlike dc_find, which
+ * returns the error code directly, this needs the return slot for the
+ * cursor pointer itself. */
+EMSCRIPTEN_KEEPALIVE dc_cursor *dcw_cursor_open(dc_collection *c,
+                                                const uint8_t *filter, int filter_len,
+                                                double skip, double limit,
+                                                const uint8_t *projection, int projection_len,
+                                                int *err_out) {
+    dc_cursor *cur = NULL;
+    int e = dc_cursor_open(c, filter, (uint32_t)filter_len,
+                           projection_len > 0 ? projection : NULL,
+                           projection_len > 0 ? (uint32_t)projection_len : 0,
+                           (int64_t)skip, (int64_t)limit, &cur);
+    *err_out = e;
+    return cur;
+}
+
+/* Writes the next up-to-max_count matches into `o` and whether the cursor is now exhausted through *done_out. */
+EMSCRIPTEN_KEEPALIVE int dcw_cursor_next_batch(dcw_out *o, dc_cursor *cur, int max_count, int *done_out) {
+    reset_out(o);
+    int done = 0;
+    int e = dc_cursor_next_batch(cur, (uint32_t)max_count, &o->buf, &o->len, &done);
+    *done_out = done;
+    return e;
+}
+
+EMSCRIPTEN_KEEPALIVE void dcw_cursor_close(dc_cursor *cur) {
+    dc_cursor_close(cur);
 }
 
 /* Returns 1 if deleted, 0 if not found, negative on error. */

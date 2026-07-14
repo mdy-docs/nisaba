@@ -145,6 +145,18 @@ typedef struct { const uint8_t *ptr; size_t len; } qry_doc;
 int qry_collect(const qry_doc *docs, size_t count, const qry_options *opts,
                 uint8_t **out, size_t *out_len);
 
+/*
+ * Apply a single field-inclusion/exclusion projection spec (the same
+ * shape qry_collect's opts->projection uses) to one document, emitting
+ * the result through *out / *out_len (freshly malloc'd, caller frees).
+ * Exposed for db.c's dc_cursor, which projects one document at a time as
+ * it streams rather than batch-projecting an already-collected array the
+ * way qry_collect does.
+ */
+int qry_project_one(const uint8_t *doc, size_t doc_len,
+                    const uint8_t *proj, size_t proj_len,
+                    uint8_t **out, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -718,9 +718,9 @@ static int parse_projection(const uint8_t *proj, size_t proj_len,
     return BJ_OK;
 }
 
-static int apply_projection(const uint8_t *doc, size_t doc_len,
-                            const uint8_t *proj, size_t proj_len,
-                            uint8_t **out, size_t *out_len) {
+int qry_project_one(const uint8_t *doc, size_t doc_len,
+                    const uint8_t *proj, size_t proj_len,
+                    uint8_t **out, size_t *out_len) {
     proj_field fields[QRY_MAX_PROJECTED_FIELDS];
     uint32_t nfields = 0; int mode = 1; int id_included = 1;
     int e = parse_projection(proj, proj_len, fields, QRY_MAX_PROJECTED_FIELDS, &nfields, &mode, &id_included);
@@ -799,7 +799,7 @@ int qry_collect(const qry_doc *docs, size_t count, const qry_options *opts,
         qry_doc d = order ? order[i].doc : docs[i];
         if (opts && opts->projection && opts->projection_len) {
             uint8_t *pj = NULL; size_t pjlen = 0;
-            e = apply_projection(d.ptr, d.len, opts->projection, opts->projection_len, &pj, &pjlen);
+            e = qry_project_one(d.ptr, d.len, opts->projection, opts->projection_len, &pj, &pjlen);
             if (!e) e = bj_put_raw(b, pj, (uint32_t)pjlen);
             free(pj);
         } else {
