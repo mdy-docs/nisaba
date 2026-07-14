@@ -3,15 +3,25 @@
   "version": "1.0.0",
   "description": "A WASM/C, MongoDB-driver-shaped embedded document database (CRUD, query operators, $regex, secondary/geo/text indexes, change streams), built on binjson and binjson-structures",
   "type": "module",
+  "main": "db.js",
   "exports": {
-    "./wasm": "./wasm/nisaba-wasm.js"
+    ".": "./db.js",
+    "./wasm": "./wasm/nisaba-wasm.js",
+    "./coordinator": "./db-coordinator.js"
   },
   "files": [
     "wasm",
     "src",
     "include",
-    "lib"
+    "lib",
+    "bin",
+    "public",
+    "db.js",
+    "db-coordinator.js"
   ],
+  "bin": {
+    "db": "bin/db.js"
+  },
   "scripts": {
     "build:wasm": "./build-wasm.sh",
     "prepack": "npm run build:wasm"
