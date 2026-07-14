@@ -1,0 +1,30 @@
+{
+  "name": "nisaba",
+  "version": "1.0.0",
+  "description": "A WASM/C, MongoDB-driver-shaped embedded document database (CRUD, query operators, $regex, secondary/geo/text indexes, change streams), built on binjson and binjson-structures",
+  "type": "module",
+  "exports": {
+    "./wasm": "./wasm/nisaba-wasm.js"
+  },
+  "files": [
+    "wasm",
+    "src",
+    "include",
+    "lib"
+  ],
+  "scripts": {
+    "build:wasm": "./build-wasm.sh",
+    "prepack": "npm run build:wasm"
+  },
+  "keywords": [
+    "database",
+    "document-database",
+    "embedded-database",
+    "mongodb",
+    "wasm",
+    "opfs",
+    "binjson"
+  ],
+  "author": "",
+  "license": "BSD-2-Clause"
+}
