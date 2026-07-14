@@ -6,4 +6,4 @@
 	url = https://github.com/mdy-docs/binjson-structures.git
 [submodule "third_party/regex-engine"]
 	path = third_party/regex-engine
-	url = https://github.com/belteshazzar/regex-engine.git
+	url = https://github.com/mdy-docs/regex-engine.git
