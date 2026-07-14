@@ -39,9 +39,12 @@
  * $regex only supports the operator-expression form ({field: {$regex:
  * "pattern", $options: "flags"}}, both plain strings) — binjson has no
  * BSON-regex wire type, so a bare native-RegExp-literal filter value isn't
- * representable in the codec at all. See regex.h for the supported
- * pattern syntax (a small backtracking engine, not full PCRE) and the `i`
- * flag being the only one implemented at this layer.
+ * representable in the codec at all. The pattern itself is ECMAScript-
+ * flavored (named groups, lookahead/lookbehind, backreferences, Unicode
+ * property escapes — see regex.h and third_party/regex-engine/README.md),
+ * but `$options` at this layer still only accepts `i`; other flags
+ * (`m`/`s`/`u`/etc.) are valid pattern syntax to compile but have no way to
+ * be requested here yet.
  *
  * Equality ($eq, and bare-literal matching) is exact encoded-byte
  * equality, same rationale as db.h: binjson's encoder is a deterministic
