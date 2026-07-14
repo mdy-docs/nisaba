@@ -1,0 +1,9 @@
+[submodule "third_party/binjson"]
+	path = third_party/binjson
+	url = https://github.com/mdy-docs/binjson.git
+[submodule "third_party/binjson-structures"]
+	path = third_party/binjson-structures
+	url = https://github.com/mdy-docs/binjson-structures.git
+[submodule "third_party/regex-engine"]
+	path = third_party/regex-engine
+	url = https://github.com/belteshazzar/regex-engine.git
