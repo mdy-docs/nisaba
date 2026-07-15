@@ -17,7 +17,8 @@
  * installed).
  */
 import { describe, it, expect } from 'vitest';
-import { ready, MemoryStorageProvider } from '../wasm/nisaba-wasm.js';
+import { ready, MemoryStorageProvider, ObjectId } from '../wasm/nisaba-wasm.js';
+import { connect } from '../src/db.js';
 import { connectShared } from '../src/db-coordinator.js';
 
 await ready();
@@ -212,6 +213,133 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
     await Promise.all(dbs.map((d) => d.close()));
   });
 
+  it('SharedCollection exposes every public Collection method and the full cursor surface (API parity)', async () => {
+    const shared = await connectShared(nextDbName(), new MemoryStorageProvider(), {});
+    const sharedColl = await shared.collection('users');
+    const realDb = await connect(new MemoryStorageProvider());
+    const realColl = await realDb.collection('users');
+
+    // Reflect over the real Collection rather than hardcoding a list, so a
+    // method added there without a SharedCollection counterpart fails here.
+    const publicMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(realColl))
+      .filter((n) => n !== 'constructor' && !n.startsWith('_') && typeof realColl[n] === 'function');
+    expect(publicMethods.length).toBeGreaterThan(20); // guards the filter itself
+    for (const m of publicMethods) {
+      expect(typeof sharedColl[m], `SharedCollection.${m}`).toBe('function');
+    }
+
+    // Same for the find() cursor's surface (sort/skip/limit/project/
+    // toArray/next/close/return + async iteration).
+    const realCursor = realColl.find({});
+    const sharedCursor = sharedColl.find({});
+    for (const key of Object.keys(realCursor)) {
+      if (typeof realCursor[key] !== 'function') continue;
+      expect(typeof sharedCursor[key], `find() cursor .${key}`).toBe('function');
+    }
+    expect(typeof sharedCursor[Symbol.asyncIterator]).toBe('function');
+    await realCursor.close();
+
+    await realDb.close();
+    await shared.close();
+  });
+
+  it('the full proxied API works end to end through a follower', async () => {
+    const provider = new MemoryStorageProvider();
+    const dbName = nextDbName();
+    const dbs = await Promise.all([
+      connectShared(dbName, provider, {}),
+      connectShared(dbName, provider, {})
+    ]);
+    const follower = dbs.find((d) => d._coord.role === 'follower');
+    const users = await follower.collection('users');
+
+    // insertMany / estimatedDocumentCount / distinct
+    const { insertedCount, insertedIds } = await users.insertMany([
+      { i: 1, team: 'core' }, { i: 2, team: 'core' }, { i: 3, team: 'infra' }
+    ]);
+    expect(insertedCount).toBe(3);
+    expect(insertedIds[0]).toBeTruthy();
+    expect(await users.estimatedDocumentCount()).toBe(3);
+    expect((await users.distinct('team')).sort()).toEqual(['core', 'infra']);
+
+    // findOne now forwards options (projection)
+    expect(await users.findOne({ i: 1 }, { projection: { i: 1, _id: 0 } })).toEqual({ i: 1 });
+
+    // Cursor: manual next(), toArray() returning only what next() hasn't
+    // handed out, and early for-await exit not hanging.
+    const cursor = users.find({}).sort({ i: 1 });
+    expect((await cursor.next()).value.i).toBe(1);
+    expect((await cursor.toArray()).map((d) => d.i)).toEqual([2, 3]);
+    expect((await cursor.next()).done).toBe(true);
+    for await (const doc of users.find({})) { void doc; break; }
+
+    // find-and-modify family
+    const updated = await users.findOneAndUpdate({ i: 2 }, { $set: { team: 'kernel' } }, { returnDocument: 'after' });
+    expect(updated.team).toBe('kernel');
+    const replaced = await users.findOneAndReplace({ i: 3 }, { i: 3, team: 'ops' }, { returnDocument: 'after' });
+    expect(replaced.team).toBe('ops');
+    expect((await users.findOneAndDelete({ i: 1 })).i).toBe(1);
+
+    // bulkWrite / deleteMany
+    const bulk = await users.bulkWrite([
+      { insertOne: { document: { i: 4, team: 'ops' } } },
+      { updateMany: { filter: { team: 'ops' }, update: { $set: { floor: 2 } } } }
+    ]);
+    expect(bulk.insertedCount).toBe(1);
+    expect(bulk.matchedCount).toBe(2);
+    expect((await users.deleteMany({})).deletedCount).toBe(3);
+
+    // pruneExpired via a TTL index created through the follower
+    await users.createIndex({ seen: 1 }, { expireAfterSeconds: 60, name: 'ttl' });
+    await users.insertOne({ seen: new Date(Date.now() - 3600 * 1000) });
+    await users.insertOne({ seen: new Date() });
+    expect(await users.pruneExpired()).toBe(1);
+
+    await Promise.all(dbs.map((d) => d.close()));
+  });
+
+  it('insertMany/bulkWrite partial-failure details survive the RPC error channel', async () => {
+    const provider = new MemoryStorageProvider();
+    const dbName = nextDbName();
+    const dbs = await Promise.all([
+      connectShared(dbName, provider, {}),
+      connectShared(dbName, provider, {})
+    ]);
+    const follower = dbs.find((d) => d._coord.role === 'follower');
+    const users = await follower.collection('users');
+
+    const dupe = new ObjectId();
+    const caught = await users.insertMany([{ _id: dupe, i: 1 }, { _id: dupe, i: 2 }, { i: 3 }])
+      .then(() => null, (e) => e);
+    expect(caught).toBeTruthy();
+    expect(caught.message).toMatch(/Duplicate _id/);
+    expect(caught.result.insertedCount).toBe(1); // what landed before the failure
+    expect(caught.result.insertedIds[0].equals(dupe)).toBe(true);
+
+    const bulkErr = await users.bulkWrite([
+      { insertOne: { document: { i: 10 } } },
+      { insertOne: { document: { _id: dupe, i: 11 } } } // dupe landed above
+    ]).then(() => null, (e) => e);
+    expect(bulkErr).toBeTruthy();
+    expect(bulkErr.result.insertedCount).toBe(1);
+    expect(bulkErr.writeErrors).toHaveLength(1);
+    expect(bulkErr.writeErrors[0].index).toBe(1);
+    expect(bulkErr.writeErrors[0].error.message).toMatch(/Duplicate _id/);
+
+    // An error *response* must not trigger the leader-gone retry: the
+    // operation already partially ran on a live leader, and re-executing
+    // it would double-apply the non-failing documents. Observable with an
+    // unordered insertMany -- a hidden retry would insert {i: 99} twice.
+    const unorderedErr = await users.insertMany(
+      [{ _id: dupe, i: -1 }, { i: 99 }], { ordered: false }
+    ).then(() => null, (e) => e);
+    expect(unorderedErr).toBeTruthy();
+    expect(unorderedErr.message).toMatch(/Duplicate _id/);
+    expect(await users.find({ i: 99 }).toArray()).toHaveLength(1);
+
+    await Promise.all(dbs.map((d) => d.close()));
+  });
+
   it('a follower-initiated compact() runs on the leader and every tab keeps working', async () => {
     const provider = new MemoryStorageProvider();
     const dbName = nextDbName();
@@ -224,8 +352,8 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
 
     // Churn through the leader so there is real history to reclaim.
     const leaderUsers = await leader.collection('users');
-    for (let i = 0; i < 40; i++) await leaderUsers.insertOne({ i, pad: 'x'.repeat(100) });
-    for (let i = 0; i < 20; i++) await leaderUsers.deleteOne({ i });
+    await leaderUsers.insertMany(Array.from({ length: 40 }, (_, i) => ({ i, pad: 'x'.repeat(100) })));
+    await leaderUsers.deleteMany({ i: { $lt: 20 } });
 
     const followerUsers = await follower.collection('users');
     const stats = await followerUsers.compact(); // proxied to the leader's real Collection

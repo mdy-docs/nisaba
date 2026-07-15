@@ -38,8 +38,12 @@
  *
  * `SharedDb`/`SharedCollection` mirror Db/Collection's public API exactly
  * (wasm/nisaba-wasm.js) so existing single-tab code barely changes to adopt
- * this; the only structural difference is `find()`'s cursor resolving with
- * one RPC call on `.toArray()`, matching the real cursor's own laziness.
+ * this -- test/db-coordinator.test.js enforces the parity by reflection.
+ * The only structural difference is `find()`'s cursor resolving with one
+ * RPC call on its first pull (toArray()/next()/iteration) rather than
+ * streaming batches; partial-failure details (insertMany/bulkWrite's
+ * `err.result`/`err.writeErrors`) are re-attached on the follower side so
+ * error handling code works unchanged too.
  */
 import { encode, decode, connect, ChangeStream } from '../wasm/nisaba-wasm.js';
 
@@ -170,8 +174,19 @@ class Coordinator {
         const p = this.pending.get(msg.requestId);
         if (!p) return; // not ours, or already timed out
         this.pending.delete(msg.requestId);
-        if (msg.type === 'error') p.reject(new Error(decode(msg.payload).message));
-        else p.resolve(decode(msg.payload));
+        if (msg.type === 'error') {
+          // Rebuild the error shape _handleRequest flattened for the wire:
+          // insertMany/bulkWrite callers rely on err.result (what DID land)
+          // and bulkWrite on err.writeErrors, so a follower must see them
+          // exactly like a local caller would.
+          const info = decode(msg.payload);
+          const err = new Error(info.message);
+          if (info.result !== undefined && info.result !== null) err.result = info.result;
+          if (info.writeErrors) err.writeErrors = info.writeErrors.map((w) => ({ index: w.index, error: new Error(w.message) }));
+          p.reject(err);
+        } else {
+          p.resolve(decode(msg.payload));
+        }
         return;
       }
       case 'change':
@@ -186,7 +201,15 @@ class Coordinator {
       const result = await executeOnRealDb(this.realDb, collectionName, method, args, this);
       this.channel.postMessage({ type: 'response', requestId: msg.requestId, payload: encode(result === undefined ? null : result) });
     } catch (err) {
-      this.channel.postMessage({ type: 'error', requestId: msg.requestId, payload: encode({ message: err.message }) });
+      // Flatten the partial-failure side channel some methods attach
+      // (insertMany's err.result, bulkWrite's err.result/err.writeErrors)
+      // into encodable data; the follower side rebuilds the Error shape.
+      // writeErrors nest real Error objects, which can't cross the codec --
+      // only their index + message survive the trip.
+      const info = { message: err.message };
+      if (err.result !== undefined) info.result = err.result;
+      if (err.writeErrors) info.writeErrors = err.writeErrors.map((w) => ({ index: w.index, message: w.error?.message ?? String(w.error) }));
+      this.channel.postMessage({ type: 'error', requestId: msg.requestId, payload: encode(info) });
     }
   }
 
@@ -241,17 +264,24 @@ class Coordinator {
 
     let timeoutId;
     const timeout = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error(`db-coordinator: request timed out (${method})`)), REQUEST_TIMEOUT_MS);
+      timeoutId = setTimeout(() => {
+        const err = new Error(`db-coordinator: request timed out (${method})`);
+        err.rpcTimeout = true;
+        reject(err);
+      }, REQUEST_TIMEOUT_MS);
     });
     try {
       return await Promise.race([result, timeout]);
     } catch (err) {
       this.pending.delete(requestId);
-      if (retried) throw err;
-      // The leader may be gone (its tab/worker closed): re-broadcast and
-      // give a new leader a bounded window to appear (either another
-      // follower's announce, or our own lock finally being granted) before
-      // one bounded retry of the original call.
+      // Retry ONLY when nothing answered (rpcTimeout): the leader may be
+      // gone (its tab/worker closed), so re-broadcast, give a new leader a
+      // bounded window to appear (another follower's announce, or our own
+      // lock finally being granted), and retry once. An error *response*
+      // means the leader is alive and the operation genuinely failed --
+      // retrying would re-execute a non-idempotent operation that already
+      // partially ran (e.g. insertMany's successfully inserted prefix).
+      if (!err.rpcTimeout || retried) throw err;
       this.channel.postMessage({ type: 'whoIsLeader' });
       await this._waitForLeaderSignal(REELECT_WAIT_MS);
       return this._rpcCall(collectionName, method, args, true);
@@ -293,11 +323,20 @@ class SharedCollection {
   async listIndexes() { return this._coord.dispatch(this.name, 'listIndexes', []); }
   async findByIndex(name, values) { return this._coord.dispatch(this.name, 'findByIndex', [name, values]); }
   async insertOne(doc) { return this._coord.dispatch(this.name, 'insertOne', [doc]); }
-  async findOne(filter = {}) { return this._coord.dispatch(this.name, 'findOne', [filter]); }
+  async insertMany(docs, options = {}) { return this._coord.dispatch(this.name, 'insertMany', [docs, options]); }
+  async findOne(filter = {}, options = {}) { return this._coord.dispatch(this.name, 'findOne', [filter, options]); }
 
-  /** Mirrors Collection.find()'s laziness (wasm/nisaba-wasm.js): chain
-   * setters mutate local state only; toArray()/iteration make exactly one
-   * RPC call with the fully resolved filter+options. */
+  /**
+   * Mirrors Collection.find()'s lazy cursor (wasm/nisaba-wasm.js): chain
+   * setters mutate local state only; toArray()/next()/iteration make
+   * exactly one RPC call with the fully resolved filter+options, then hand
+   * documents out locally. There is no streaming batch protocol across the
+   * BroadcastChannel, so unlike the real cursor, next() here materializes
+   * the full result set up front -- which also means it works after
+   * .sort(), where the real cursor's streaming path refuses. Consumption
+   * semantics match the real cursor: one pass, toArray() returns whatever
+   * next() hasn't handed out yet, close()/early-`for await` exit end it.
+   */
   find(filter = {}, options = {}) {
     const coord = this._coord, name = this.name;
     const state = {
@@ -306,27 +345,61 @@ class SharedCollection {
       limit: options.limit || 0,
       projection: options.projection || null
     };
+    let items = null; // full result set, fetched by the first pull
+    let idx = 0;
+    let closed = false;
     const cursor = {
       sort(spec) { state.sort = spec; return cursor; },
       skip(n) { state.skip = n; return cursor; },
       limit(n) { state.limit = n; return cursor; },
       project(spec) { state.projection = spec; return cursor; },
-      async toArray() { return coord.dispatch(name, 'find', [filter, { ...state }]); },
-      async *[Symbol.asyncIterator]() { for (const doc of await this.toArray()) yield doc; }
+
+      async toArray() {
+        if (closed) return [];
+        if (items === null) items = await coord.dispatch(name, 'find', [filter, { ...state }]);
+        const rest = items.slice(idx);
+        idx = items.length;
+        closed = true;
+        return rest;
+      },
+
+      /** Manual pull, `{ value, done }` -- same shape as the real cursor's. */
+      async next() {
+        if (closed) return { value: undefined, done: true };
+        if (items === null) items = await coord.dispatch(name, 'find', [filter, { ...state }]);
+        if (idx >= items.length) { closed = true; return { value: undefined, done: true }; }
+        return { value: items[idx++], done: false };
+      },
+
+      [Symbol.asyncIterator]() { return cursor; },
+
+      /** Safe to call more than once, or on an already-exhausted cursor. */
+      async close() { closed = true; },
+
+      /** Invoked by `for await` on early exit (break/throw). */
+      async return() { await cursor.close(); return { value: undefined, done: true }; }
     };
     return cursor;
   }
 
   async deleteOne(filter = {}) { return this._coord.dispatch(this.name, 'deleteOne', [filter]); }
+  async deleteMany(filter = {}) { return this._coord.dispatch(this.name, 'deleteMany', [filter]); }
+  async findOneAndDelete(filter = {}) { return this._coord.dispatch(this.name, 'findOneAndDelete', [filter]); }
+  async replaceOne(filter, replacement, options = {}) { return this._coord.dispatch(this.name, 'replaceOne', [filter, replacement, options]); }
+  async findOneAndReplace(filter, replacement, options = {}) { return this._coord.dispatch(this.name, 'findOneAndReplace', [filter, replacement, options]); }
+  async updateOne(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateOne', [filter, update, options]); }
+  async findOneAndUpdate(filter, update, options = {}) { return this._coord.dispatch(this.name, 'findOneAndUpdate', [filter, update, options]); }
+  async updateMany(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateMany', [filter, update, options]); }
+  async countDocuments(filter = {}) { return this._coord.dispatch(this.name, 'countDocuments', [filter]); }
+  async estimatedDocumentCount() { return this._coord.dispatch(this.name, 'estimatedDocumentCount', []); }
+  async distinct(field, filter = {}) { return this._coord.dispatch(this.name, 'distinct', [field, filter]); }
+  async bulkWrite(operations, options = {}) { return this._coord.dispatch(this.name, 'bulkWrite', [operations, options]); }
+  async pruneExpired() { return this._coord.dispatch(this.name, 'pruneExpired', []); }
   /** Runs on the leader (the only context holding the files). The leader
    * serializes it with other RPCs the same way as any write; an operation
    * that does race the swap fails loud on the real Collection's barrier
    * (wasm/nisaba-wasm.js) and can simply be retried. */
   async compact() { return this._coord.dispatch(this.name, 'compact', []); }
-  async replaceOne(filter, replacement, options = {}) { return this._coord.dispatch(this.name, 'replaceOne', [filter, replacement, options]); }
-  async updateOne(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateOne', [filter, update, options]); }
-  async updateMany(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateMany', [filter, update, options]); }
-  async countDocuments(filter = {}) { return this._coord.dispatch(this.name, 'countDocuments', [filter]); }
 
   /** Same shape/scope limits as Collection.watch() (wasm/nisaba-wasm.js),
    * but sees writes from every tab sharing this database, not just this

@@ -434,9 +434,17 @@ const users = await db.collection('users');
   `navigator.locks.request` — no polling, no split-brain) and is the only
   one that actually opens the real `Db`/OPFS files; every other context
   gets a `SharedDb`/`SharedCollection` — the *same public API* as
-  `Db`/`Collection` (including `watch()`) — that proxies calls over one
-  `BroadcastChannel` per `dbName`, payloads binjson-encoded so
-  `ObjectId`/`Date` survive the trip.
+  `Db`/`Collection` (including `watch()`; enforced by a reflection test) —
+  that proxies calls over one `BroadcastChannel` per `dbName`, payloads
+  binjson-encoded so `ObjectId`/`Date` survive the trip. Partial-failure
+  details cross too: a follower's failed `insertMany`/`bulkWrite` carries
+  the same `err.result`/`err.writeErrors` a local caller would see.
+- One structural difference: a `SharedCollection.find()` cursor has the
+  full cursor API, but materializes its complete result set with a single
+  RPC on the first pull (`toArray()`/`next()`/iteration) instead of
+  streaming batches — there is no batch protocol across the channel. A
+  side effect is that `next()` works after `.sort()` here, which the real
+  cursor's streaming path refuses.
 - Must run inside a dedicated `Worker` (not the main thread) — same
   requirement OPFS access already has in this repo.
 - If the leader's tab/worker closes, a queued follower is automatically
