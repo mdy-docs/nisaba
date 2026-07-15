@@ -61,6 +61,25 @@ describe('db: catalog + collection primitives', () => {
     await db.close();
   });
 
+  it('insertOne accepts a duck-typed ObjectId-shaped value (not instanceof, e.g. from a different binjson copy) for _id and other fields', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    const real = new ObjectId();
+    // Simulates a value built against a *different* copy of binjson's
+    // ObjectId class (e.g. a thin client package depending only on
+    // binjson, not this whole engine) -- same shape, not instanceof.
+    const foreign = { toHexString: () => real.toHexString(), toBytes: () => real.toBytes() };
+    expect(foreign).not.toBeInstanceOf(ObjectId);
+
+    await users.insertOne({ _id: foreign, name: 'Ada', authorId: foreign });
+    const doc = await users.findOne({ _id: real });
+    expect(doc.name).toBe('Ada');
+    expect(doc._id.equals(real)).toBe(true);
+    expect(doc.authorId).toBeInstanceOf(ObjectId);
+    expect(doc.authorId.equals(real)).toBe(true);
+    await db.close();
+  });
+
   it('insertOne rejects a duplicate _id', async () => {
     const db = await openDb();
     const users = await db.collection('users');

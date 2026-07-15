@@ -129,7 +129,7 @@ function writeValue(M, val) {
   if (val === false) { check(M._bjw_put_bool(0)); return; }
   if (val === true) { check(M._bjw_put_bool(1)); return; }
 
-  if (val instanceof ObjectId) {
+  if (val instanceof ObjectId || (val && typeof val.toBytes === 'function' && typeof val.toHexString === 'function')) {
     withBytes(M, val.toBytes(), (p) => check(M._bjw_put_oid(p)));
     return;
   }
@@ -1908,9 +1908,19 @@ function applyDelta(source, delta) {
 const DB_CATALOG_FILE = '__catalog__.bj';
 const DB_DEFAULT_ORDER = 32;
 
+/**
+ * Duck-types rather than strict `instanceof ObjectId`: a caller that built
+ * its own value against a *different* copy of binjson's ObjectId (same
+ * class, different module instance -- e.g. a thin client package that only
+ * depends on binjson, not this whole engine) would otherwise fail this
+ * check even though it's a perfectly valid 12-byte id, re-wrapped here into
+ * this module's own canonical ObjectId via the hex round-trip. Mirrors how
+ * the real MongoDB driver tolerates cross-realm/cross-copy ObjectId values.
+ */
 function toObjectId(id) {
   if (id instanceof ObjectId) return id;
   if (typeof id === 'string') return new ObjectId(id);
+  if (id && typeof id.toHexString === 'function') return new ObjectId(id.toHexString());
   throw new Error(`Invalid _id: ${id}`);
 }
 
