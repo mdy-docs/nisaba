@@ -1937,25 +1937,52 @@ function checkDbName(name) {
   }
 }
 
-function collectionFileName(name) {
-  return `coll-${name}.bj`;
+/**
+ * Compaction generations (docs/compaction.md): Collection.compact() rewrites
+ * a collection's whole file set into fresh files carrying a `g<N>-` prefix
+ * and records the new names in the catalog -- the catalog entry, not this
+ * naming convention, is what _open() trusts. A *prefix* rather than a
+ * `.g<N>` suffix so a generation can never collide with a gen-0 name:
+ * every gen-0 file starts with `coll-`/`idx-` while every gen>0 file
+ * starts with `g<digits>-`, and collection/index names may legally contain
+ * dots (a collection literally named "users.g2" must not claim generation
+ * 2 of "users"). gen 0 keeps the historical un-prefixed names, so
+ * pre-compaction databases open unchanged.
+ */
+function genPrefix(gen) {
+  return gen ? `g${gen}-` : '';
 }
 
-function indexFileName(collectionName, indexName) {
-  return `idx-${collectionName}-${indexName}.bj`;
+function collectionFileName(name, gen = 0) {
+  return `${genPrefix(gen)}coll-${name}.bj`;
+}
+
+function indexFileName(collectionName, indexName, gen = 0) {
+  return `${genPrefix(gen)}idx-${collectionName}-${indexName}.bj`;
 }
 
 /** A text index needs the same three files a TextIndex always does. */
-function textIndexFileNames(collectionName, indexName) {
-  const base = `idx-${collectionName}-${indexName}`;
+function textIndexFileNames(collectionName, indexName, gen = 0) {
+  const base = `${genPrefix(gen)}idx-${collectionName}-${indexName}`;
   return { index: `${base}-terms.bj`, docTerms: `${base}-documents.bj`, docLengths: `${base}-lengths.bj` };
 }
 
 /** Cross-file commit journal (milestone 5, docs/db-plan.md): makes every
- * document write atomic across the primary tree + attached index files. */
-function journalFileName(collectionName) {
-  return `coll-${collectionName}-journal.bj`;
+ * document write atomic across the primary tree + attached index files.
+ * A journal's recorded lengths are only meaningful for the exact files it
+ * was written against (docs/textindex-atomicity.md), so compact() gives
+ * each generation its own journal, recorded in the catalog entry as
+ * `journal`; readers fall back to the gen-0 name for entries written
+ * before that field existed. */
+function journalFileName(collectionName, gen = 0) {
+  return `${genPrefix(gen)}coll-${collectionName}-journal.bj`;
 }
+
+/** Every file name this layer can create for itself -- any generation of a
+ * collection/index/journal file. What Db.open()'s orphan sweep is allowed
+ * to delete when the catalog doesn't reference it; deliberately excludes
+ * the catalog file and anything a host put in the same directory. */
+const DB_FILE_PATTERN = /^(?:g\d+-)?(?:coll|idx)-.*\.bj$/;
 
 /** Default index name mirroring the real driver's convention: "team_1",
  * "team_1_age_1" for a compound index. Only ascending (1) fields are
@@ -1999,6 +2026,13 @@ class MemoryStorageProvider {
     this._files.delete(name);
   }
 
+  /** Names of every file currently stored. Optional on a provider; having
+   * it lets Db.open() sweep files orphaned by a crashed compact() or
+   * dropCollection (see Db._sweepOrphans). */
+  async listFiles() {
+    return [...this._files.keys()];
+  }
+
   /** A named, isolated storage scope nested under this one -- Client.db(name)'s equivalent of OPFSStorageProvider.subProvider's real subdirectory, backed by its own independent file map rather than a real filesystem. Cached: repeat calls with the same name return the same instance. */
   async subProvider(name) {
     let child = this._children.get(name);
@@ -2032,6 +2066,17 @@ class OPFSStorageProvider {
 
   async deleteFile(name) {
     await deleteFile(await this._dir(), name);
+  }
+
+  /** Names of every file in this provider's directory. Optional on a
+   * provider; having it lets Db.open() sweep files orphaned by a crashed
+   * compact() or dropCollection (see Db._sweepOrphans). */
+  async listFiles() {
+    const names = [];
+    for await (const [name, handle] of (await this._dir()).entries()) {
+      if (handle.kind === 'file') names.push(name);
+    }
+    return names;
   }
 
   /** A real OPFS subdirectory (created if needed) as its own provider -- Client.db(name)'s on-disk unit, one subdirectory per logical database under this provider's own directory, mirroring the cloud service's per-tenant `<tenantId>/<dbName>/` layout (service/tenant-worker.js). */
@@ -2159,6 +2204,23 @@ class Collection {
     this._journalFd = -1;
     this._watchers = new Set(); // open ChangeStreams (see watch())
     this._openCursors = new Set(); // open find() cursors holding a live WASM-side dc_cursor (see find())
+    this._compacting = false;   // compact() in flight -- see _barrier()
+  }
+
+  /**
+   * Refuse an operation while compact() is rebuilding/swapping this
+   * collection's files. Fail-loud instead of queueing: a mutation
+   * interleaving with the build phase would leave the new generation
+   * internally inconsistent (its files are streamed one at a time from the
+   * live trees), and a read interleaving with the swap window would touch
+   * freed WASM handles. The check is synchronous and compact() spans only
+   * its own awaits, so a caller that awaits its operations in order --
+   * including compact() itself -- can never trip this.
+   */
+  _barrier(op) {
+    if (this._compacting) {
+      throw new Error(`${op}: collection "${this.name}" is being compacted -- retry after compact() resolves`);
+    }
   }
 
   /**
@@ -2269,8 +2331,10 @@ class Collection {
     // Cross-file commit journal (milestone 5): must be recovered only after
     // every index above is attached, mirroring TextIndex's tix_recover
     // contract ("right after all trees are open"). Always on -- every
-    // collection gets this consistency guarantee automatically.
-    this._journal = await this._provider.openFile(journalFileName(this.name), { create: true });
+    // collection gets this consistency guarantee automatically. The name
+    // is catalog-recorded once compact() has run (each generation gets its
+    // own journal); entries older than that field use the gen-0 name.
+    this._journal = await this._provider.openFile(entry.journal || journalFileName(this.name), { create: true });
     this._journalFd = registerHandle(M, this._journal);
     const rc = M._dcw_collection_recover(this._collCtx, this._journalFd);
     if (rc !== 0) {
@@ -2289,8 +2353,17 @@ class Collection {
   }
 
   async _close() {
+    this._barrier('close');
     for (const stream of [...this._watchers]) stream.close();
     for (const fcursor of [...this._openCursors]) await fcursor.close();
+    await this._closeHandles();
+  }
+
+  /** Release every file handle and WASM context (indexes, journal,
+   * dc_collection, output slot, primary tree) without touching the
+   * watcher/cursor bookkeeping -- shared by _close() and compact()'s
+   * adopt step, which must keep watchers alive across its reopen. */
+  async _closeHandles() {
     await this._closeIndexes();
     if (this._journalFd >= 0) {
       unregisterHandle(requireModule(), this._journalFd);
@@ -2357,6 +2430,7 @@ class Collection {
    * Returns the index name (options.name, or a MongoDB-shaped default).
    */
   async createIndex(keys, options = {}) {
+    this._barrier('createIndex');
     const keyFields = Object.keys(keys);
     const isSpecial = keyFields.length === 1 && (keys[keyFields[0]] === 'text' || keys[keyFields[0]] === '2dsphere');
     if (isSpecial && (options.unique || options.sparse || options.partialFilterExpression || options.expireAfterSeconds !== undefined)) {
@@ -2476,6 +2550,7 @@ class Collection {
   }
 
   async dropIndex(name) {
+    this._barrier('dropIndex');
     const entry = this._indexes.get(name);
     if (!entry) throw new Error(`Index not found: ${name}`);
     const M = requireModule();
@@ -2503,6 +2578,7 @@ class Collection {
   }
 
   async listIndexes() {
+    this._barrier('listIndexes'); // _indexes is transiently empty during compact()'s reopen
     return [...this._indexes.entries()].map(([name, ix]) => {
       if (ix.kind === 'equality') {
         const def = { name, key: Object.fromEntries(ix.fields.map(f => [f, 1])) };
@@ -2524,6 +2600,7 @@ class Collection {
    * filter operator instead (db.c dispatches to the right index).
    */
   async findByIndex(name, values) {
+    this._barrier('findByIndex');
     const entry = this._indexes.get(name);
     if (!entry) throw new Error(`Index not found: ${name}`);
     if (entry.kind !== 'equality') throw new Error(`findByIndex requires an equality index (got kind: ${entry.kind})`);
@@ -2542,6 +2619,7 @@ class Collection {
   }
 
   async insertOne(doc) {
+    this._barrier('insertOne');
     if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
       throw new Error('insertOne requires a document object');
     }
@@ -2563,6 +2641,7 @@ class Collection {
    * needs to report success/failure per index (see dc_insert_many).
    */
   async insertMany(docs, { ordered = true } = {}) {
+    this._barrier('insertMany');
     if (!Array.isArray(docs) || docs.length === 0) {
       throw new Error('insertMany requires a non-empty array of documents');
     }
@@ -2595,6 +2674,7 @@ class Collection {
 
   /** `options.projection` follows the same inclusion-XOR-exclusion rules as find()'s (`_id` defaults included). */
   async findOne(filter = {}, options = {}) {
+    this._barrier('findOne');
     const M = requireModule();
     const fbytes = encode(filter);
     const projBytes = options.projection ? encode(options.projection) : new Uint8Array(0);
@@ -2652,6 +2732,7 @@ class Collection {
     const BATCH = 100;
 
     async function eagerToArray() {
+      collection._barrier('find');
       const M = requireModule();
       const fBytes = encode(filter);
       const sortBytes = state.sort ? encode(state.sort) : new Uint8Array(0);
@@ -2724,6 +2805,7 @@ class Collection {
     }
 
     async function fetchBatch(maxCount) {
+      collection._barrier('find');
       const M = requireModule();
       if (!wasmCursor) openWasmCursor();
       const doneP = M._malloc(4);
@@ -2791,6 +2873,7 @@ class Collection {
   }
 
   async deleteOne(filter = {}) {
+    this._barrier('deleteOne');
     const M = requireModule();
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
@@ -2803,6 +2886,7 @@ class Collection {
 
   /** Delete every document matching `filter`. */
   async deleteMany(filter = {}) {
+    this._barrier('deleteMany');
     const M = requireModule();
     const watching = this._watchers.size > 0;
     const preIds = watching ? (await this.find(filter, { projection: { _id: 1 } }).toArray()).map(d => d._id) : null;
@@ -2818,6 +2902,7 @@ class Collection {
   /** Atomically find the first document matching `filter` and delete it,
    * returning the deleted document (or null if nothing matched). */
   async findOneAndDelete(filter = {}) {
+    this._barrier('findOneAndDelete');
     const M = requireModule();
     const fbytes = encode(filter);
     const found = withBytes(M, fbytes, (p, n) => M._dcw_find_one_and_delete(this._outCtx, this._collCtx, p, n));
@@ -2883,6 +2968,7 @@ class Collection {
   }
 
   async replaceOne(filter, replacement, { upsert = false } = {}) {
+    this._barrier('replaceOne');
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('replaceOne requires a replacement document object');
     }
@@ -2914,6 +3000,7 @@ class Collection {
    * to return, matching real MongoDB).
    */
   async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
+    this._barrier('findOneAndReplace');
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('findOneAndReplace requires a replacement document object');
     }
@@ -2941,6 +3028,7 @@ class Collection {
    * use replaceOne instead.
    */
   async updateOne(filter, update, { upsert = false } = {}) {
+    this._barrier('updateOne');
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateOne requires an update document object');
     }
@@ -2971,6 +3059,7 @@ class Collection {
    * findOneAndReplace's exact convention for "nothing to return".
    */
   async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
+    this._barrier('findOneAndUpdate');
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('findOneAndUpdate requires an update document object');
     }
@@ -2996,6 +3085,7 @@ class Collection {
    * matching) — modifiedCount always mirrors matchedCount.
    */
   async updateMany(filter, update, { upsert = false } = {}) {
+    this._barrier('updateMany');
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateMany requires an update document object');
     }
@@ -3028,6 +3118,7 @@ class Collection {
   }
 
   async countDocuments(filter = {}) {
+    this._barrier('countDocuments');
     const M = requireModule();
     const fbytes = encode(filter);
     const n = withBytes(M, fbytes, (p, len) => M._dcw_count(this._collCtx, p, len));
@@ -3045,6 +3136,7 @@ class Collection {
   /** Unique values of `field` (dot-separated path) across every document
    * matching `filter`. */
   async distinct(field, filter = {}) {
+    this._barrier('distinct');
     const M = requireModule();
     const f = allocStr(M, field);
     const fbytes = encode(filter);
@@ -3073,6 +3165,7 @@ class Collection {
    * error afterward if any failed.
    */
   async bulkWrite(operations, { ordered = true } = {}) {
+    this._barrier('bulkWrite');
     if (!Array.isArray(operations) || operations.length === 0) {
       throw new Error('bulkWrite requires a non-empty array of operations');
     }
@@ -3144,6 +3237,7 @@ class Collection {
    * removed across all TTL indexes.
    */
   async pruneExpired() {
+    this._barrier('pruneExpired');
     let deletedCount = 0;
     for (const ix of this._indexes.values()) {
       if (ix.kind !== 'equality' || ix.expireAfterSeconds === undefined) continue;
@@ -3152,6 +3246,143 @@ class Collection {
       deletedCount += n;
     }
     return deletedCount;
+  }
+
+  /** Total bytes across this collection's open backing files (primary
+   * tree + every index file + journal) -- what compact() reclaims from,
+   * and what Db.compact()'s growth heuristic measures. */
+  _storageBytes() {
+    let n = this._tree.syncAccessHandle.getSize();
+    for (const ix of this._indexes.values()) {
+      if (ix.kind === 'equality') n += ix.tree.syncAccessHandle.getSize();
+      else if (ix.kind === 'text') { for (const role of Object.keys(ix.trees)) n += ix.trees[role].syncAccessHandle.getSize(); }
+      else n += ix.rt.syncAccessHandle.getSize();
+    }
+    if (this._journal) n += this._journal.getSize();
+    return n;
+  }
+
+  /**
+   * Reclaim the space append-only history costs: stream every live entry
+   * of this collection's whole file set (primary tree + every index) into
+   * fresh, minimal, fully-packed files, atomically swap them in, and
+   * delete the old ones. See docs/compaction.md for the design; in short:
+   *
+   *   - The swap is one catalog commit flipping this collection's entry to
+   *     generation-prefixed new file names plus a fresh, empty cross-file
+   *     journal of its own -- a crash on either side of that commit leaves
+   *     a complete, consistent generation live, and Db.open() sweeps
+   *     whichever side lost.
+   *   - The whole set moves together because the journal's recorded file
+   *     lengths are only meaningful for the exact files it was written
+   *     against (docs/textindex-atomicity.md).
+   *   - Concurrency: throws if a find() cursor is open (its WASM scan is
+   *     positioned inside the old files -- db.h's documented hazard), and
+   *     any operation arriving mid-compact throws rather than corrupting
+   *     the new generation (see _barrier).
+   *   - History is destroyed: snapshots/boundaries of the old files become
+   *     invalid, matching bpt_compact's own contract.
+   *
+   * Returns { generation, bytesBefore, bytesAfter, bytesFreed }.
+   */
+  async compact() {
+    this._barrier('compact');
+    if (this._openCursors.size > 0) {
+      throw new Error(`compact: collection "${this.name}" has open find() cursors -- close or exhaust them first`);
+    }
+    this._compacting = true;
+    const created = []; // new-generation files, deleted on pre-flip failure
+    let flipped = false;
+    try {
+      const entry = this._catalog.search(this.name);
+      const generation = (entry.gen || 0) + 1;
+      const bytesBefore = this._storageBytes();
+
+      // ---- Build: stream every live structure into gen-prefixed files.
+      // The old trees stay untouched (bpt_compact/rtw_compact only read
+      // their source), so a failure anywhere in here leaves the
+      // collection fully live.
+      let bytesBuilt = 0;
+      const compactInto = async (structure, fileName) => {
+        const dest = await this._provider.openFile(fileName, { create: true });
+        created.push(fileName);
+        const { newSize } = await structure.compact(dest); // truncates, streams, flushes, closes dest
+        bytesBuilt += newSize;
+      };
+
+      const oldFiles = [entry.file, entry.journal || journalFileName(this.name)];
+      const newEntry = { ...entry, gen: generation, file: collectionFileName(this.name, generation), indexes: [] };
+      await compactInto(this._tree, newEntry.file);
+
+      for (const def of entry.indexes || []) {
+        const ix = this._indexes.get(def.name);
+        const kind = def.kind || 'equality';
+        if (kind === 'text') {
+          const files = textIndexFileNames(this.name, def.name, generation);
+          for (const role of Object.keys(def.files)) {
+            oldFiles.push(def.files[role]);
+            await compactInto(ix.trees[role], files[role]);
+          }
+          newEntry.indexes.push({ ...def, files });
+        } else {
+          const file = indexFileName(this.name, def.name, generation);
+          oldFiles.push(def.file);
+          await compactInto(kind === 'geo' ? ix.rt : ix.tree, file);
+          newEntry.indexes.push({ ...def, file });
+        }
+      }
+
+      // The new generation starts with its own empty journal: the old
+      // one's recorded lengths describe the old files only. truncate(0)
+      // clears a stale leftover from a crashed earlier attempt.
+      newEntry.journal = journalFileName(this.name, generation);
+      const jh = await this._provider.openFile(newEntry.journal, { create: true });
+      created.push(newEntry.journal);
+      jh.truncate(0);
+      jh.flush();
+      await jh.close();
+
+      newEntry.compactedBytes = bytesBuilt; // Db.compact()'s growth-factor baseline
+
+      // ---- Flip: one atomic catalog commit points this collection at the
+      // new generation. Flushed before the old files go away -- if the OS
+      // lost an unflushed flip after the deletes below, the recovered
+      // catalog would reference deleted files.
+      this._catalog.add(this.name, newEntry);
+      this._catalog.flush();
+      flipped = true;
+
+      // ---- Adopt: reopen everything from the flipped entry. Watchers
+      // survive (_closeHandles leaves them alone); _open() re-attaches
+      // every index and recovers the fresh journal.
+      await this._closeHandles();
+      this._tree = new BPlusTree(await this._provider.openFile(newEntry.file, { create: false }), this._order);
+      await this._open();
+
+      // ---- Cleanup: drop the old generation. Best-effort -- anything
+      // left behind (e.g. a crash right here) is unreferenced by the
+      // catalog and swept at the next Db.open().
+      for (const f of oldFiles) {
+        try { await this._provider.deleteFile(f); } catch { /* swept later */ }
+      }
+
+      const bytesAfter = this._storageBytes();
+      return { generation, bytesBefore, bytesAfter, bytesFreed: Math.max(0, bytesBefore - bytesAfter) };
+    } catch (err) {
+      // Pre-flip failure: the old generation is still live -- drop the
+      // half-built files (one whose dest handle a failed compact left
+      // open can't be deleted yet; the sweep gets it). Post-flip failure
+      // (adopt threw): the new generation is authoritative -- keep it and
+      // surface the error; reopening the Db recovers.
+      if (!flipped) {
+        for (const f of created) {
+          try { await this._provider.deleteFile(f); } catch { /* swept later */ }
+        }
+      }
+      throw err;
+    } finally {
+      this._compacting = false;
+    }
   }
 }
 
@@ -3169,7 +3400,34 @@ class Db {
     const handle = await this._provider.openFile(DB_CATALOG_FILE, { create: true });
     this._catalog = new BPlusTree(handle, this._order);
     await this._catalog.open();
+    await this._sweepOrphans();
     this.isOpen = true;
+  }
+
+  /**
+   * Delete any database-owned file (DB_FILE_PATTERN) the catalog doesn't
+   * reference -- the leftovers of a compact() or dropCollection that
+   * crashed between its atomic catalog commit and its file deletes. The
+   * catalog is the sole source of truth for which generation of a
+   * collection's files is live, so an unreferenced file is garbage by
+   * definition. Skipped silently for storage providers without
+   * listFiles(): sweeping is a space optimization, never a correctness
+   * requirement.
+   */
+  async _sweepOrphans() {
+    if (typeof this._provider.listFiles !== 'function') return;
+    const referenced = new Set([DB_CATALOG_FILE]);
+    for (const { key: name, value: entry } of this._catalog.toArray()) {
+      referenced.add(entry.file);
+      referenced.add(entry.journal || journalFileName(name));
+      for (const def of entry.indexes || []) {
+        if (def.kind === 'text') { for (const role of Object.keys(def.files)) referenced.add(def.files[role]); }
+        else referenced.add(def.file);
+      }
+    }
+    for (const f of await this._provider.listFiles()) {
+      if (!referenced.has(f) && DB_FILE_PATTERN.test(f)) await this._provider.deleteFile(f);
+    }
   }
 
   async close() {
@@ -3225,8 +3483,33 @@ class Db {
       }
     }
     await this._provider.deleteFile(entry.file);
-    await this._provider.deleteFile(journalFileName(name));
+    await this._provider.deleteFile(entry.journal || journalFileName(name));
     return true;
+  }
+
+  /**
+   * Compact every collection (see Collection.compact and
+   * docs/compaction.md). With no options it is unconditional, mirroring
+   * collection.compact(). `minBytes`/`factor` make it cheap to call
+   * eagerly (on a timer, or from whichever tab holds coordinator
+   * leadership -- the same host-driven convention as pruneExpired()): a
+   * collection is skipped (result null) unless its file set is at least
+   * `minBytes` and at least `factor` times its size right after its
+   * previous compaction; a never-compacted collection only needs to clear
+   * `minBytes`. Returns { [collectionName]: stats | null }.
+   */
+  async compact({ minBytes = 0, factor = 0 } = {}) {
+    const results = {};
+    for (const name of await this.listCollections()) {
+      const coll = await this.collection(name);
+      if (minBytes || factor) {
+        const entry = this._catalog.search(name);
+        const floor = Math.max(minBytes, factor * (entry.compactedBytes || 0));
+        if (coll._storageBytes() < floor) { results[name] = null; continue; }
+      }
+      results[name] = await coll.compact();
+    }
+    return results;
   }
 }
 

@@ -178,6 +178,15 @@ async function main() {
     console.log('remaining:', (await users.find({}).toArray()).map(d => d.name));
     console.log();
 
+    console.log('=== compact ===');
+    // Append-only files grow with write traffic, not live data; compact()
+    // rewrites the collection's whole file set without its history and
+    // atomically swaps it in (docs/compaction.md).
+    const { generation, bytesBefore, bytesAfter, bytesFreed } = await users.compact();
+    console.log(`compacted to generation ${generation}: ${bytesBefore} -> ${bytesAfter} bytes (${bytesFreed} freed)`);
+    console.log('data intact:', (await users.find({}).toArray()).map(d => d.name));
+    console.log();
+
     console.log('=== listCollections / dropCollection ===');
     console.log('collections:', await db.listCollections());
     await db.dropCollection('users');

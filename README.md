@@ -81,3 +81,6 @@ isolated storage scope — see `Client.db(name)`.
   history and scope decisions (historical; see the note at its top).
 - [`docs/textindex-atomicity.md`](docs/textindex-atomicity.md) — how the
   text index stays atomic across its backing files.
+- [`docs/compaction.md`](docs/compaction.md) — how `compact()` reclaims
+  the space append-only storage costs, via an atomic catalog-commit swap
+  of a collection's whole file set.

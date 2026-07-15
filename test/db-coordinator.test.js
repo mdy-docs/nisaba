@@ -212,6 +212,39 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
     await Promise.all(dbs.map((d) => d.close()));
   });
 
+  it('a follower-initiated compact() runs on the leader and every tab keeps working', async () => {
+    const provider = new MemoryStorageProvider();
+    const dbName = nextDbName();
+    const dbs = await Promise.all([
+      connectShared(dbName, provider, {}),
+      connectShared(dbName, provider, {})
+    ]);
+    const leader = dbs.find((d) => d._coord.role === 'leader');
+    const follower = dbs.find((d) => d !== leader);
+
+    // Churn through the leader so there is real history to reclaim.
+    const leaderUsers = await leader.collection('users');
+    for (let i = 0; i < 40; i++) await leaderUsers.insertOne({ i, pad: 'x'.repeat(100) });
+    for (let i = 0; i < 20; i++) await leaderUsers.deleteOne({ i });
+
+    const followerUsers = await follower.collection('users');
+    const stats = await followerUsers.compact(); // proxied to the leader's real Collection
+    expect(stats.generation).toBe(1);
+    expect(stats.bytesFreed).toBeGreaterThan(0);
+
+    // Both tabs still read and write the (swapped) collection.
+    await followerUsers.insertOne({ i: 999 });
+    expect(await leaderUsers.countDocuments({})).toBe(21);
+    expect((await followerUsers.find({ i: 999 }).toArray())).toHaveLength(1);
+
+    // Db-level compact via a follower, with thresholds: freshly compacted,
+    // so the growth factor skips it.
+    const skipped = await follower.compact({ minBytes: 1, factor: 4 });
+    expect(skipped.users).toBeNull();
+
+    await Promise.all(dbs.map((d) => d.close()));
+  });
+
   it('two independent shared databases do not cross-talk', async () => {
     const providerA = new MemoryStorageProvider();
     const providerB = new MemoryStorageProvider();

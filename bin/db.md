@@ -28,6 +28,7 @@ and per index.
 | --- | --- |
 | `collections` | List collection names (default) |
 | `drop-collection <coll>` | Drop a collection and its indexes |
+| `compact [coll]` | Rewrite a collection's files (all collections if omitted) without their append-only history, reclaiming space — see `docs/compaction.md` |
 | `insert <coll> <doc>` | Insert one document |
 | `insert-many <coll> <docs>` | Insert an array of documents |
 | `find <coll> [filter]` | Find matching documents (`{}` if omitted) |

@@ -27,6 +27,7 @@ everywhere else in this package — no BSON, no JSON, no lossy conversion.
   - [`bulkWrite`](#bulkwrite)
   - [Indexes](#indexes)
   - [Change streams (`watch`)](#change-streams-watch)
+  - [Compaction (`compact`)](#compaction-compact)
 - [Query operators](#query-operators)
 - [Update operators](#update-operators)
 - [Multi-tab sharing (`connectShared`)](#multi-tab-sharing-connectshared)
@@ -97,6 +98,7 @@ subdirectory per database name.
 | `db.collection(name)` | Open (or create) a collection. Returns the same cached `Collection` instance for repeated calls with the same name. `name` may not contain `/` or a NUL byte. |
 | `db.listCollections()` | Array of every collection name in this database. |
 | `db.dropCollection(name)` | Delete a collection and all its indexes/files. Returns `false` if it didn't exist. |
+| `db.compact(options?)` | Compact every collection — see [Compaction](#compaction-compact). `{ minBytes, factor }` skip collections not worth rewriting yet. |
 | `db.close()` | Close every open collection (and their indexes) and the catalog file. |
 
 ## `Collection`
@@ -308,6 +310,49 @@ See `index.html` + `src/db-worker.js` for a live multi-tab demo (`npm run
 dev`, then open http://localhost:8086/ in two or more browser tabs;
 `npm run build` + `npm run preview` serves the production bundle the
 same way).
+
+### Compaction (`compact`)
+
+Every backing file is append-only: updates and deletes append new tree
+nodes and never reclaim old ones, so files grow monotonically with write
+traffic, not with live data. `compact()` rewrites the collection's whole
+file set (primary tree + every index + a fresh commit journal) as
+minimal, fully-packed files and atomically swaps them in — the
+append-only analog of MongoDB's `compact` command. See
+`docs/compaction.md` for the design (atomic swap via one catalog commit,
+crash windows, orphan sweeping).
+
+```js
+const stats = await users.compact();
+// => { generation: 1, bytesBefore: 182_344, bytesAfter: 21_580, bytesFreed: 160_764 }
+
+// Or every collection at once, optionally with cheap skip thresholds:
+await db.compact();                             // unconditional
+await db.compact({ minBytes: 1 << 20, factor: 4 }); // only what's worth doing
+```
+
+- **`collection.compact()`** rewrites unconditionally. Throws if the
+  collection has open (unexhausted, unclosed) `find()` cursors — close
+  them first. Any other operation issued while a `compact()` is in
+  flight fails with a "being compacted" error rather than corrupting the
+  rewrite; a caller that `await`s its operations in order never sees
+  this. `watch()` streams stay attached across the swap.
+- **`db.compact({ minBytes = 0, factor = 0 })`** runs
+  `collection.compact()` on each collection, skipping (result `null`)
+  any whose file set is smaller than `minBytes` or hasn't grown to
+  `factor ×` its size right after its previous compaction. With both
+  options set it is cheap to call eagerly — on a timer, or from
+  whichever tab holds coordinator leadership — the same host-driven
+  convention as `pruneExpired()`. Returns
+  `{ [collectionName]: stats | null }`.
+- **Space**: while a compact runs, old and new file sets exist
+  side-by-side, so peak usage is roughly *old + live* bytes.
+- **History**: compaction destroys the old file's append-only history —
+  B+ tree snapshots/`boundaries()` taken against the old files become
+  invalid.
+- Works through `connectShared` too (`SharedCollection.compact()` /
+  `SharedDb.compact()` proxy to the leader), and from the CLI:
+  `db <name> compact [coll]`.
 
 ## Query operators
 

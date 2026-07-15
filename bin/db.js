@@ -26,6 +26,9 @@ subdirectory holding its catalog and collection/index files.
 Database commands:
   collections                            List collection names (default)
   drop-collection <coll>                 Drop a collection and its indexes
+  compact [coll]                         Rewrite a collection's files (all
+                                         collections if omitted) without their
+                                         append-only history, reclaiming space
 
 Document commands:
   insert <coll> <doc>                    Insert one document
@@ -250,6 +253,26 @@ async function main() {
         } else {
           console.log(`Collection ${args[0]} does not exist; nothing dropped.`);
           process.exitCode = 1;
+        }
+        break;
+      }
+
+      case 'compact': {
+        if (args[0]) {
+          const coll = await db.collection(args[0]);
+          const { generation, bytesBefore, bytesAfter, bytesFreed } = await coll.compact();
+          console.log(`Compacted ${args[0]} (generation ${generation}): ${bytesBefore} -> ${bytesAfter} bytes (${bytesFreed} freed).`);
+        } else {
+          const results = await db.compact();
+          const names = Object.keys(results);
+          if (names.length === 0) {
+            console.log('No collections.');
+            break;
+          }
+          for (const name of names) {
+            const r = results[name];
+            console.log(`${name}: ${r.bytesBefore} -> ${r.bytesAfter} bytes (${r.bytesFreed} freed, generation ${r.generation})`);
+          }
         }
         break;
       }

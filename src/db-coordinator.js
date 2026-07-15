@@ -318,6 +318,11 @@ class SharedCollection {
   }
 
   async deleteOne(filter = {}) { return this._coord.dispatch(this.name, 'deleteOne', [filter]); }
+  /** Runs on the leader (the only context holding the files). The leader
+   * serializes it with other RPCs the same way as any write; an operation
+   * that does race the swap fails loud on the real Collection's barrier
+   * (wasm/nisaba-wasm.js) and can simply be retried. */
+  async compact() { return this._coord.dispatch(this.name, 'compact', []); }
   async replaceOne(filter, replacement, options = {}) { return this._coord.dispatch(this.name, 'replaceOne', [filter, replacement, options]); }
   async updateOne(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateOne', [filter, update, options]); }
   async updateMany(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateMany', [filter, update, options]); }
@@ -346,6 +351,7 @@ class SharedDb {
   async collection(name) { return new SharedCollection(this._coord, name); }
   async listCollections() { return this._coord.dispatch(null, 'listCollections', []); }
   async dropCollection(name) { return this._coord.dispatch(null, 'dropCollection', [name]); }
+  async compact(options = {}) { return this._coord.dispatch(null, 'compact', [options]); }
   async close() { return this._coord.close(); }
 }
 
