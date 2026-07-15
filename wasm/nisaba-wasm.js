@@ -2206,23 +2206,29 @@ class Collection {
     this._journalFd = -1;
     this._watchers = new Set(); // open ChangeStreams (see watch())
     this._openCursors = new Set(); // open find() cursors holding a live WASM-side dc_cursor (see find())
-    this._compacting = false;   // compact() in flight -- see _barrier()
-  }
-
-  /**
-   * Refuse an operation while compact() is rebuilding/swapping this
-   * collection's files. Fail-loud instead of queueing: a mutation
-   * interleaving with the build phase would leave the new generation
-   * internally inconsistent (its files are streamed one at a time from the
-   * live trees), and a read interleaving with the swap window would touch
-   * freed WASM handles. The check is synchronous and compact() spans only
-   * its own awaits, so a caller that awaits its operations in order --
-   * including compact() itself -- can never trip this.
-   */
-  _barrier(op) {
-    if (this._compacting) {
-      throw new Error(`${op}: collection "${this.name}" is being compacted -- retry after compact() resolves`);
-    }
+    // The in-flight compact(), as null or a promise that settles when it
+    // finishes. Every public operation opens with
+    //     while (this._compacting) await this._compacting;
+    // queueing behind the compact rather than interleaving with it (a
+    // mutation during the build phase would leave the new generation
+    // internally inconsistent -- its files are streamed one at a time from
+    // the live trees -- and a read during the adopt window would touch
+    // freed WASM handles). Queueing rather than failing loud so a compact
+    // triggered elsewhere (another tab via connectShared, the autoCompact
+    // sweep) is a brief wait for concurrent callers, never a spurious
+    // error. Two rules keep it sound, both relying on async functions
+    // running synchronously until their first await:
+    //   - The loop is inlined at every site, not wrapped in a shared async
+    //     helper: resuming from the await must fall straight through into
+    //     the operation's own synchronous body. A helper's extra microtask
+    //     hop would let a compact() queued on the same promise set the
+    //     flag between the check and the body.
+    //   - It's a loop, not an `if`: a queued compact() may start (and set
+    //     the flag again) the moment the previous one settles.
+    // When the flag is null the loop never awaits, so an operation issued
+    // before a same-tick compact() still runs its synchronous body first,
+    // exactly as a synchronous check would have allowed.
+    this._compacting = null;
   }
 
   /**
@@ -2355,7 +2361,7 @@ class Collection {
   }
 
   async _close() {
-    this._barrier('close');
+    while (this._compacting) await this._compacting;
     for (const stream of [...this._watchers]) stream.close();
     for (const fcursor of [...this._openCursors]) await fcursor.close();
     await this._closeHandles();
@@ -2432,7 +2438,7 @@ class Collection {
    * Returns the index name (options.name, or a MongoDB-shaped default).
    */
   async createIndex(keys, options = {}) {
-    this._barrier('createIndex');
+    while (this._compacting) await this._compacting;
     const keyFields = Object.keys(keys);
     const isSpecial = keyFields.length === 1 && (keys[keyFields[0]] === 'text' || keys[keyFields[0]] === '2dsphere');
     if (isSpecial && (options.unique || options.sparse || options.partialFilterExpression || options.expireAfterSeconds !== undefined)) {
@@ -2552,7 +2558,7 @@ class Collection {
   }
 
   async dropIndex(name) {
-    this._barrier('dropIndex');
+    while (this._compacting) await this._compacting;
     const entry = this._indexes.get(name);
     if (!entry) throw new Error(`Index not found: ${name}`);
     const M = requireModule();
@@ -2580,7 +2586,7 @@ class Collection {
   }
 
   async listIndexes() {
-    this._barrier('listIndexes'); // _indexes is transiently empty during compact()'s reopen
+    while (this._compacting) await this._compacting; // _indexes is transiently empty during compact()'s reopen
     return [...this._indexes.entries()].map(([name, ix]) => {
       if (ix.kind === 'equality') {
         const def = { name, key: Object.fromEntries(ix.fields.map(f => [f, 1])) };
@@ -2602,7 +2608,7 @@ class Collection {
    * filter operator instead (db.c dispatches to the right index).
    */
   async findByIndex(name, values) {
-    this._barrier('findByIndex');
+    while (this._compacting) await this._compacting;
     const entry = this._indexes.get(name);
     if (!entry) throw new Error(`Index not found: ${name}`);
     if (entry.kind !== 'equality') throw new Error(`findByIndex requires an equality index (got kind: ${entry.kind})`);
@@ -2621,7 +2627,7 @@ class Collection {
   }
 
   async insertOne(doc) {
-    this._barrier('insertOne');
+    while (this._compacting) await this._compacting;
     if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
       throw new Error('insertOne requires a document object');
     }
@@ -2643,7 +2649,7 @@ class Collection {
    * needs to report success/failure per index (see dc_insert_many).
    */
   async insertMany(docs, { ordered = true } = {}) {
-    this._barrier('insertMany');
+    while (this._compacting) await this._compacting;
     if (!Array.isArray(docs) || docs.length === 0) {
       throw new Error('insertMany requires a non-empty array of documents');
     }
@@ -2676,7 +2682,7 @@ class Collection {
 
   /** `options.projection` follows the same inclusion-XOR-exclusion rules as find()'s (`_id` defaults included). */
   async findOne(filter = {}, options = {}) {
-    this._barrier('findOne');
+    while (this._compacting) await this._compacting;
     const M = requireModule();
     const fbytes = encode(filter);
     const projBytes = options.projection ? encode(options.projection) : new Uint8Array(0);
@@ -2734,7 +2740,7 @@ class Collection {
     const BATCH = 100;
 
     async function eagerToArray() {
-      collection._barrier('find');
+      while (collection._compacting) await collection._compacting;
       const M = requireModule();
       const fBytes = encode(filter);
       const sortBytes = state.sort ? encode(state.sort) : new Uint8Array(0);
@@ -2807,7 +2813,7 @@ class Collection {
     }
 
     async function fetchBatch(maxCount) {
-      collection._barrier('find');
+      while (collection._compacting) await collection._compacting;
       const M = requireModule();
       if (!wasmCursor) openWasmCursor();
       const doneP = M._malloc(4);
@@ -2875,7 +2881,7 @@ class Collection {
   }
 
   async deleteOne(filter = {}) {
-    this._barrier('deleteOne');
+    while (this._compacting) await this._compacting;
     const M = requireModule();
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
@@ -2888,7 +2894,7 @@ class Collection {
 
   /** Delete every document matching `filter`. */
   async deleteMany(filter = {}) {
-    this._barrier('deleteMany');
+    while (this._compacting) await this._compacting;
     const M = requireModule();
     const watching = this._watchers.size > 0;
     const preIds = watching ? (await this.find(filter, { projection: { _id: 1 } }).toArray()).map(d => d._id) : null;
@@ -2904,7 +2910,7 @@ class Collection {
   /** Atomically find the first document matching `filter` and delete it,
    * returning the deleted document (or null if nothing matched). */
   async findOneAndDelete(filter = {}) {
-    this._barrier('findOneAndDelete');
+    while (this._compacting) await this._compacting;
     const M = requireModule();
     const fbytes = encode(filter);
     const found = withBytes(M, fbytes, (p, n) => M._dcw_find_one_and_delete(this._outCtx, this._collCtx, p, n));
@@ -2970,7 +2976,7 @@ class Collection {
   }
 
   async replaceOne(filter, replacement, { upsert = false } = {}) {
-    this._barrier('replaceOne');
+    while (this._compacting) await this._compacting;
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('replaceOne requires a replacement document object');
     }
@@ -3002,7 +3008,7 @@ class Collection {
    * to return, matching real MongoDB).
    */
   async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
-    this._barrier('findOneAndReplace');
+    while (this._compacting) await this._compacting;
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('findOneAndReplace requires a replacement document object');
     }
@@ -3030,7 +3036,7 @@ class Collection {
    * use replaceOne instead.
    */
   async updateOne(filter, update, { upsert = false } = {}) {
-    this._barrier('updateOne');
+    while (this._compacting) await this._compacting;
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateOne requires an update document object');
     }
@@ -3061,7 +3067,7 @@ class Collection {
    * findOneAndReplace's exact convention for "nothing to return".
    */
   async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
-    this._barrier('findOneAndUpdate');
+    while (this._compacting) await this._compacting;
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('findOneAndUpdate requires an update document object');
     }
@@ -3087,7 +3093,7 @@ class Collection {
    * matching) — modifiedCount always mirrors matchedCount.
    */
   async updateMany(filter, update, { upsert = false } = {}) {
-    this._barrier('updateMany');
+    while (this._compacting) await this._compacting;
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateMany requires an update document object');
     }
@@ -3120,7 +3126,7 @@ class Collection {
   }
 
   async countDocuments(filter = {}) {
-    this._barrier('countDocuments');
+    while (this._compacting) await this._compacting;
     const M = requireModule();
     const fbytes = encode(filter);
     const n = withBytes(M, fbytes, (p, len) => M._dcw_count(this._collCtx, p, len));
@@ -3138,7 +3144,7 @@ class Collection {
   /** Unique values of `field` (dot-separated path) across every document
    * matching `filter`. */
   async distinct(field, filter = {}) {
-    this._barrier('distinct');
+    while (this._compacting) await this._compacting;
     const M = requireModule();
     const f = allocStr(M, field);
     const fbytes = encode(filter);
@@ -3167,7 +3173,7 @@ class Collection {
    * error afterward if any failed.
    */
   async bulkWrite(operations, { ordered = true } = {}) {
-    this._barrier('bulkWrite');
+    while (this._compacting) await this._compacting;
     if (!Array.isArray(operations) || operations.length === 0) {
       throw new Error('bulkWrite requires a non-empty array of operations');
     }
@@ -3239,7 +3245,7 @@ class Collection {
    * removed across all TTL indexes.
    */
   async pruneExpired() {
-    this._barrier('pruneExpired');
+    while (this._compacting) await this._compacting;
     let deletedCount = 0;
     for (const ix of this._indexes.values()) {
       if (ix.kind !== 'equality' || ix.expireAfterSeconds === undefined) continue;
@@ -3279,20 +3285,22 @@ class Collection {
    *     lengths are only meaningful for the exact files it was written
    *     against (docs/textindex-atomicity.md).
    *   - Concurrency: throws if a find() cursor is open (its WASM scan is
-   *     positioned inside the old files -- db.h's documented hazard), and
-   *     any operation arriving mid-compact throws rather than corrupting
-   *     the new generation (see _barrier).
+   *     positioned inside the old files -- db.h's documented hazard);
+   *     any operation arriving mid-compact queues behind it and runs
+   *     against the new generation (see _compacting's doc in the
+   *     constructor), so other callers see a brief wait, not an error.
    *   - History is destroyed: snapshots/boundaries of the old files become
    *     invalid, matching bpt_compact's own contract.
    *
    * Returns { generation, bytesBefore, bytesAfter, bytesFreed }.
    */
   async compact() {
-    this._barrier('compact');
+    while (this._compacting) await this._compacting; // back-to-back compacts serialize like any other op
     if (this._openCursors.size > 0) {
       throw new Error(`compact: collection "${this.name}" has open find() cursors -- close or exhaust them first`);
     }
-    this._compacting = true;
+    let settleCompacting;
+    this._compacting = new Promise((resolve) => { settleCompacting = resolve; });
     const created = []; // new-generation files, deleted on pre-flip failure
     let flipped = false;
     try {
@@ -3383,18 +3391,33 @@ class Collection {
       }
       throw err;
     } finally {
-      this._compacting = false;
+      this._compacting = null; // cleared before settling so resumed waiters see the gate open
+      settleCompacting();
     }
   }
 }
 
 class Db {
-  constructor(provider, { order = DB_DEFAULT_ORDER } = {}) {
+  constructor(provider, { order = DB_DEFAULT_ORDER, autoCompact = null } = {}) {
     this._provider = provider;
     this._order = order;
     this._catalog = null;
     this._collections = new Map();
+    this._opening = new Map(); // name -> in-flight collection() promise (see collection())
     this.isOpen = false;
+    // { minBytes?, factor? } | null -- when set, open() schedules one
+    // growth-heuristic compaction sweep (docs/compaction.md, "When to
+    // compact") instead of leaving the timing entirely to the host. Under
+    // connectShared the options ride along to whichever context wins
+    // leadership (Coordinator._becomeLeader calls connect()), so a newly
+    // elected leader re-runs the sweep -- the "compact on leadership
+    // acquisition" convention, built in.
+    this._autoCompact = autoCompact;
+    // Promise of the deferred sweep's Db.compact() results (null once it
+    // has settled after a failure); stays null when autoCompact is off.
+    // Awaitable for tests and hosts that want to observe the outcome --
+    // open() itself never waits on it.
+    this.autoCompacted = null;
   }
 
   async open() {
@@ -3404,6 +3427,19 @@ class Db {
     await this._catalog.open();
     await this._sweepOrphans();
     this.isOpen = true;
+    if (this._autoCompact) {
+      const { minBytes = 0, factor = 0 } = this._autoCompact;
+      // Fire-and-forget: open() resolves immediately; operations the host
+      // issues meanwhile queue per-collection at worst (see _compacting's
+      // doc in Collection). skipBusy skips, rather than disturbs, any
+      // collection a host cursor is already reading.
+      this.autoCompacted = this.compact({ minBytes, factor, skipBusy: true }).catch((err) => {
+        // A db closed mid-sweep is the expected way to interrupt it (the
+        // host is shutting down); anything else deserves a trace.
+        if (this.isOpen) console.warn(`nisaba: autoCompact sweep failed: ${err.message}`);
+        return null;
+      });
+    }
   }
 
   /**
@@ -3446,22 +3482,36 @@ class Db {
     checkCollectionName(name);
     const cached = this._collections.get(name);
     if (cached) return cached;
-
-    let entry = this._catalog.search(name);
-    if (!entry) {
-      entry = { file: collectionFileName(name) };
-      this._catalog.add(name, entry);
-    }
-    const handle = await this._provider.openFile(entry.file, { create: true });
-    const tree = new BPlusTree(handle, this._order);
-    const collection = new Collection(name, tree, {
-      catalog: this._catalog,
-      provider: this._provider,
-      order: this._order
-    });
-    await collection._open();
-    this._collections.set(name, collection);
-    return collection;
+    // Dedupe concurrent first-opens: the cache is only set once _open()
+    // resolves, so without this, two same-tick collection(name) calls
+    // (e.g. the autoCompact sweep racing the host's own first call) would
+    // each open the whole file set -- fatal on OPFS, whose sync access
+    // handles are exclusive per file.
+    const inFlight = this._opening.get(name);
+    if (inFlight) return inFlight;
+    const opening = (async () => {
+      try {
+        let entry = this._catalog.search(name);
+        if (!entry) {
+          entry = { file: collectionFileName(name) };
+          this._catalog.add(name, entry);
+        }
+        const handle = await this._provider.openFile(entry.file, { create: true });
+        const tree = new BPlusTree(handle, this._order);
+        const collection = new Collection(name, tree, {
+          catalog: this._catalog,
+          provider: this._provider,
+          order: this._order
+        });
+        await collection._open();
+        this._collections.set(name, collection);
+        return collection;
+      } finally {
+        this._opening.delete(name);
+      }
+    })();
+    this._opening.set(name, opening);
+    return opening;
   }
 
   async listCollections() {
@@ -3498,12 +3548,17 @@ class Db {
    * collection is skipped (result null) unless its file set is at least
    * `minBytes` and at least `factor` times its size right after its
    * previous compaction; a never-compacted collection only needs to clear
-   * `minBytes`. Returns { [collectionName]: stats | null }.
+   * `minBytes`. `skipBusy` also skips (null) any collection with open
+   * find() cursors or a compact already in flight, instead of
+   * Collection.compact()'s throw -- what an unattended sweep (the
+   * autoCompact option, a host timer) wants: a busy collection gets its
+   * turn on the next sweep. Returns { [collectionName]: stats | null }.
    */
-  async compact({ minBytes = 0, factor = 0 } = {}) {
+  async compact({ minBytes = 0, factor = 0, skipBusy = false } = {}) {
     const results = {};
     for (const name of await this.listCollections()) {
       const coll = await this.collection(name);
+      if (skipBusy && (coll._openCursors.size > 0 || coll._compacting)) { results[name] = null; continue; }
       if (minBytes || factor) {
         const entry = this._catalog.search(name);
         const floor = Math.max(minBytes, factor * (entry.compactedBytes || 0));
@@ -3515,6 +3570,18 @@ class Db {
   }
 }
 
+/**
+ * Options (all optional):
+ *   - order: B+ tree fan-out (DB_DEFAULT_ORDER).
+ *   - autoCompact: { minBytes?, factor? } -- schedule one deferred
+ *     Db.compact({ minBytes, factor, skipBusy: true }) sweep as soon as
+ *     open() completes, without delaying connect() itself. The built-in
+ *     version of the "compact on open / on a timer" host convention
+ *     (docs/compaction.md, "When to compact"); observable via
+ *     db.autoCompacted. Under connectShared the same options reach every
+ *     newly elected leader's connect(), so leadership acquisition
+ *     re-triggers the sweep.
+ */
 async function connect(provider, options) {
   const db = new Db(provider, options);
   await db.open();

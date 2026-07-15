@@ -48,6 +48,9 @@ const db2 = await connect(new OPFSStorageProvider(dir));
 
 `connect(provider, options?)` returns an already-open `Db`. `options.order`
 sets the underlying B+ tree order (default 32) — rarely needs changing.
+`options.autoCompact` (`{ minBytes?, factor? }`) schedules a deferred
+compaction sweep after every open — see
+[Compaction](#compaction-compact).
 
 For sharing one database across multiple browser tabs/workers, see
 [Multi-tab sharing](#multi-tab-sharing-connectshared) instead of `connect`.
@@ -98,7 +101,7 @@ subdirectory per database name.
 | `db.collection(name)` | Open (or create) a collection. Returns the same cached `Collection` instance for repeated calls with the same name. `name` may not contain `/` or a NUL byte. |
 | `db.listCollections()` | Array of every collection name in this database. |
 | `db.dropCollection(name)` | Delete a collection and all its indexes/files. Returns `false` if it didn't exist. |
-| `db.compact(options?)` | Compact every collection — see [Compaction](#compaction-compact). `{ minBytes, factor }` skip collections not worth rewriting yet. |
+| `db.compact(options?)` | Compact every collection — see [Compaction](#compaction-compact). `{ minBytes, factor }` skip collections not worth rewriting yet; `{ skipBusy }` skips ones with open cursors. |
 | `db.close()` | Close every open collection (and their indexes) and the catalog file. |
 
 ## `Collection`
@@ -329,22 +332,35 @@ const stats = await users.compact();
 // Or every collection at once, optionally with cheap skip thresholds:
 await db.compact();                             // unconditional
 await db.compact({ minBytes: 1 << 20, factor: 4 }); // only what's worth doing
+
+// Or let the engine sweep at its own natural moments (open, and -- under
+// connectShared -- every leadership acquisition):
+const db2 = await connect(provider, { autoCompact: { minBytes: 1 << 20, factor: 4 } });
+await db2.autoCompacted; // optional: the deferred sweep's results
 ```
 
 - **`collection.compact()`** rewrites unconditionally. Throws if the
   collection has open (unexhausted, unclosed) `find()` cursors — close
   them first. Any other operation issued while a `compact()` is in
-  flight fails with a "being compacted" error rather than corrupting the
-  rewrite; a caller that `await`s its operations in order never sees
-  this. `watch()` streams stay attached across the swap.
-- **`db.compact({ minBytes = 0, factor = 0 })`** runs
+  flight simply waits for it and then runs against the new generation —
+  a brief queue, never an error. `watch()` streams stay attached across
+  the swap.
+- **`db.compact({ minBytes = 0, factor = 0, skipBusy = false })`** runs
   `collection.compact()` on each collection, skipping (result `null`)
   any whose file set is smaller than `minBytes` or hasn't grown to
-  `factor ×` its size right after its previous compaction. With both
-  options set it is cheap to call eagerly — on a timer, or from
-  whichever tab holds coordinator leadership — the same host-driven
-  convention as `pruneExpired()`. Returns
-  `{ [collectionName]: stats | null }`.
+  `factor ×` its size right after its previous compaction. `skipBusy`
+  also skips, rather than throws on, collections with open cursors —
+  for unattended sweeps. With thresholds set it is cheap to call
+  eagerly — on a timer, the same host-driven convention as
+  `pruneExpired()`. Returns `{ [collectionName]: stats | null }`.
+- **`connect(provider, { autoCompact: { minBytes, factor } })`** builds
+  the convention in: one deferred
+  `db.compact({ minBytes, factor, skipBusy: true })` sweep fires after
+  `open()` completes, without delaying `connect()`; `db.autoCompacted`
+  resolves with its results (`null` after a failure, which warns;
+  closing mid-sweep quietly abandons it). Under `connectShared` the
+  options reach every newly elected leader's `connect()`, so a
+  leadership handover re-runs the sweep.
 - **Space**: while a compact runs, old and new file sets exist
   side-by-side, so peak usage is roughly *old + live* bytes.
 - **History**: compaction destroys the old file's append-only history —

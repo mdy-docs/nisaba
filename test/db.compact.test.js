@@ -257,21 +257,34 @@ describe('db: collection compaction', () => {
     await db.close();
   });
 
-  it('fails operations loudly instead of interleaving them with a compact', async () => {
+  it('queues operations issued mid-compact behind it instead of interleaving or failing', async () => {
     const provider = new MemoryStorageProvider();
-    const { db, users } = await seedUsers(provider);
+    const { db, users, survivors } = await seedUsers(provider);
     // The non-sparse teamIdx makes indexed fields mandatory, compact or not.
     const doc = () => ({ i: -1, team: 'late', bio: 'arrived mid-compact', loc: point(9, 9) });
 
     const compacting = users.compact(); // _compacting is set synchronously
-    await expect(users.insertOne(doc())).rejects.toThrow(/being compacted/);
-    await expect(users.findOne({})).rejects.toThrow(/being compacted/);
-    await expect(users.find({}).toArray()).rejects.toThrow(/being compacted/);
-    await expect(users.compact()).rejects.toThrow(/being compacted/);
-    await compacting;
+    // All issued while the compact is in flight; each must resolve, in
+    // order, against the *new* generation -- never interleave with the
+    // build, never surface a "being compacted" error.
+    const settled = [];
+    compacting.then(() => settled.push('compact'));
+    const queued = Promise.all([
+      users.insertOne(doc()).then(() => settled.push('insert')),
+      users.findOne({ i: -1 }),
+      users.find({ team: 'late' }).toArray(),
+      users.compact() // back-to-back compacts serialize too
+    ]);
 
-    await users.insertOne(doc()); // and the gate lifts afterwards
-    expect(await users.findOne({ i: -1 })).not.toBeNull();
+    await compacting;
+    const [, found, viaCursor, secondStats] = await queued;
+    expect(settled).toEqual(['compact', 'insert']); // the gate held the insert until the swap finished
+    expect(found.i).toBe(-1);
+    expect(viaCursor).toHaveLength(1);
+    expect(secondStats.generation).toBe(2); // the queued compact ran as its own generation
+    expect(await users.countDocuments({})).toBe(survivors.length + 1);
+    // The queued insert's index entries landed in the new generation.
+    expect((await users.find({ $text: { $search: 'arrived' } }).toArray())[0].i).toBe(-1);
     await db.close();
   });
 
@@ -426,5 +439,85 @@ describe('db: Db.compact()', () => {
     const third = await db.compact({ minBytes: 1, factor: 2 });
     expect(third.big.generation).toBe(2);
     await db.close();
+  });
+
+  it('skipBusy skips a collection with open cursors instead of throwing', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connect(provider);
+    const busy = await db.collection('busy');
+    const idle = await db.collection('idle');
+    for (const coll of [busy, idle]) {
+      await coll.insertMany(Array.from({ length: 250 }, (_, i) => ({ i })));
+      await coll.deleteMany({ i: { $lt: 100 } });
+    }
+
+    const cursor = busy.find({});
+    await cursor.next(); // > one batch left, so the WASM cursor stays open
+
+    const results = await db.compact({ skipBusy: true });
+    expect(results.busy).toBeNull();          // skipped, not thrown
+    expect(results.idle.generation).toBe(1);  // the rest of the sweep still ran
+
+    await cursor.close();
+    const retry = await db.compact({ skipBusy: true });
+    expect(retry.busy.generation).toBe(1);    // gets its turn on the next sweep
+    await db.close();
+  });
+});
+
+describe('db: autoCompact on connect()', () => {
+  /** Seed + churn through a plain connect, then close -- the reopen-with-
+   * autoCompact scenario is the realistic one (next page load / next
+   * leadership acquisition), since a brand-new db has nothing to sweep. */
+  async function churnedProvider() {
+    const provider = new MemoryStorageProvider();
+    const { db } = await seedUsers(provider);
+    await db.close();
+    return provider;
+  }
+
+  it('runs one deferred sweep after open, without blocking connect()', async () => {
+    const provider = await churnedProvider();
+    const db = await connect(provider, { autoCompact: { minBytes: 1 } });
+    expect(db.isOpen).toBe(true); // connect() resolved without waiting for the sweep
+
+    const results = await db.autoCompacted;
+    expect(results.users.generation).toBe(1);
+    expect(results.users.bytesFreed).toBeGreaterThan(0);
+    expect(await (await db.collection('users')).countDocuments({})).toBeGreaterThan(0);
+    await db.close();
+  });
+
+  it('operations issued right after connect() queue behind the sweep, never fail', async () => {
+    const provider = await churnedProvider();
+    const db = await connect(provider, { autoCompact: { minBytes: 1 } });
+    // Issued while the sweep may hold the collection's compaction gate.
+    const users = await db.collection('users');
+    const { insertedId } = await users.insertOne({ i: 999, team: 'late', bio: 'post-sweep', loc: point(1, 1) });
+    expect((await users.findOne({ _id: insertedId })).i).toBe(999);
+    await db.autoCompacted;
+    await db.close();
+  });
+
+  it('respects the growth heuristic: a freshly compacted db is left alone', async () => {
+    const provider = await churnedProvider();
+    const first = await connect(provider, { autoCompact: { minBytes: 1, factor: 2 } });
+    expect((await first.autoCompacted).users.generation).toBe(1);
+    await first.close();
+
+    // Reopen: nothing has grown past factor x the new baseline.
+    const second = await connect(provider, { autoCompact: { minBytes: 1, factor: 2 } });
+    expect((await second.autoCompacted).users).toBeNull();
+    await second.close();
+  });
+
+  it('stays null without the option, and a close() mid-sweep is quiet', async () => {
+    const plain = await connect(await churnedProvider());
+    expect(plain.autoCompacted).toBeNull();
+    await plain.close();
+
+    const db = await connect(await churnedProvider(), { autoCompact: { minBytes: 1 } });
+    await db.close(); // interrupts the in-flight sweep -- must not warn or reject
+    expect(await db.autoCompacted).toBeDefined(); // settles either way
   });
 });

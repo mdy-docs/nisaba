@@ -121,6 +121,51 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
     await Promise.all(survivors.map((d) => d.close()));
   });
 
+  it('autoCompact options reach the initial leader and every later-elected leader', async () => {
+    const provider = new MemoryStorageProvider();
+    const dbName = nextDbName();
+    // Seed + churn through a plain connect first -- a brand-new shared db
+    // would have nothing for the election-time sweep to do.
+    {
+      const db = await connect(provider);
+      const users = await db.collection('users');
+      await users.insertMany(Array.from({ length: 120 }, (_, i) => ({ i, pad: 'x'.repeat(120) })));
+      await users.deleteMany({ i: { $lt: 60 } });
+      await db.close();
+    }
+
+    const opts = { autoCompact: { minBytes: 1 } };
+    const [a, b] = await Promise.all([
+      connectShared(dbName, provider, opts),
+      connectShared(dbName, provider, opts)
+    ]);
+    const leader = a._coord.role === 'leader' ? a : b;
+    const follower = leader === a ? b : a;
+
+    // Election opened the real Db with the forwarded options: the winning
+    // context's connect() ran the sweep.
+    const swept = await leader._coord.realDb.autoCompacted;
+    expect(swept.users.generation).toBe(1);
+
+    // Hand leadership over; the new leader's own connect() re-runs the
+    // sweep -- "compact on leadership acquisition", built in. (minBytes: 1
+    // and no factor means even the freshly compacted set qualifies again.)
+    await leader.close();
+    let realDb = null;
+    for (let attempt = 0; attempt < 50 && !realDb; attempt++) {
+      if (follower._coord.role === 'leader' && follower._coord.realDb) realDb = follower._coord.realDb;
+      else await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(realDb).toBeTruthy();
+    const reswept = await realDb.autoCompacted;
+    expect(reswept.users.generation).toBe(2);
+
+    // And the data survived both sweeps.
+    const users = await follower.collection('users');
+    expect((await users.find({}).toArray())).toHaveLength(60);
+    await follower.close();
+  });
+
   it('a follower\'s watch() sees a write made through the leader', async () => {
     const provider = new MemoryStorageProvider();
     const dbName = nextDbName();

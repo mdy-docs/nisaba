@@ -395,10 +395,10 @@ class SharedCollection {
   async distinct(field, filter = {}) { return this._coord.dispatch(this.name, 'distinct', [field, filter]); }
   async bulkWrite(operations, options = {}) { return this._coord.dispatch(this.name, 'bulkWrite', [operations, options]); }
   async pruneExpired() { return this._coord.dispatch(this.name, 'pruneExpired', []); }
-  /** Runs on the leader (the only context holding the files). The leader
-   * serializes it with other RPCs the same way as any write; an operation
-   * that does race the swap fails loud on the real Collection's barrier
-   * (wasm/nisaba-wasm.js) and can simply be retried. */
+  /** Runs on the leader (the only context holding the files). An operation
+   * from any tab that races the swap simply queues behind it on the real
+   * Collection's compaction gate (wasm/nisaba-wasm.js, _compacting) -- a
+   * brief wait inside the normal RPC timeout, not an error. */
   async compact() { return this._coord.dispatch(this.name, 'compact', []); }
 
   /** Same shape/scope limits as Collection.watch() (wasm/nisaba-wasm.js),
@@ -433,7 +433,10 @@ class SharedDb {
  * connectShared with the same `dbName` against the same OPFS directory.
  * Exactly one caller becomes the leader and actually opens `provider`'s
  * files; every other caller transparently proxies to it. `options` is
- * forwarded to connect() (./db.js) verbatim.
+ * forwarded to connect() (./db.js) verbatim -- which means an
+ * `autoCompact` option reaches every newly elected leader's connect(),
+ * so a leadership handover re-runs the compaction sweep exactly when a
+ * tab has just closed and nobody is mid-interaction.
  */
 async function connectShared(dbName, provider, options) {
   if (typeof dbName !== 'string' || dbName.length === 0) {

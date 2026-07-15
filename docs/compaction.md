@@ -140,35 +140,39 @@ providers that don't — orphans cost space, never correctness.
 
 ## Concurrency
 
-Compaction is stop-the-world for the one collection, fail-loud rather
-than queueing:
+Compaction is stop-the-world for the one collection; everyone else
+queues:
 
 - `compact()` **throws if any `find()` cursor is open** — a cursor's
   WASM-side scan is physically positioned inside the old files (the
-  hazard `db.h` documents for `dc_cursor`).
+  hazard `db.h` documents for `dc_cursor`), and a paused iteration can
+  be held indefinitely, so waiting for it could never be bounded.
 - While a compact is in flight, **every other operation on that
-  collection throws** a "being compacted" error (a synchronous flag
-  check at each public entry point). A mutation that interleaved with
-  the build phase would make the new generation internally inconsistent
-  — the files are streamed one at a time — and a read that interleaved
-  with the adopt phase would touch freed WASM handles. Failing loudly
-  is simple, impossible to deadlock, and invisible to any caller that
-  awaits its operations in order (the barrier can only trip when calls
-  are issued concurrently with a pending `compact()`).
+  collection waits for it** and then runs against the new generation
+  (`_compacting` in `wasm/nisaba-wasm.js` — each public entry point
+  opens with an inline gate loop; the field's doc comment explains why
+  it must be inlined rather than shared as a helper). Interleaving is
+  what the gate exists to prevent: a mutation during the build phase
+  would make the new generation internally inconsistent — the files
+  are streamed one at a time — and a read during the adopt phase would
+  touch freed WASM handles. The wait is bounded by the one compact
+  (back-to-back `compact()` calls serialize the same way), so to any
+  concurrent caller a compact is a brief latency blip, never an error.
 - Under `connectShared`, `compact` is an ordinary proxied method: only
   the leader holds files, so the swap happens where the handles live,
-  and a follower RPC that races it gets the same retryable error.
+  and a follower RPC that races it queues on the leader like any local
+  caller — invisible as long as the compact fits inside the RPC
+  timeout.
 
 Blocking writes during compaction is what real MongoDB's `compact` did
-for years; the difference here is only that waiting is the caller's
-choice rather than an internal queue.
+for years; here the block is an internal queue measured in the length
+of one file-set rewrite.
 
 ## When to compact
 
-Nothing triggers compaction automatically — the same host-driven
-convention as TTL pruning (`pruneExpired()`): browsers give no reliable
-background execution, and only the host knows its idle moments. Two
-knobs make eager polling cheap:
+No timer runs inside the engine — browsers give no reliable background
+execution, so recurring schedules stay host-driven, the same convention
+as TTL pruning (`pruneExpired()`). Two knobs make eager polling cheap:
 
 - Each compact records `compactedBytes` (the new set's total size) in
   the catalog entry.
@@ -176,12 +180,38 @@ knobs make eager polling cheap:
   file bytes are under `minBytes`, or under `factor ×` its
   `compactedBytes` baseline. Skipped collections cost a few `getSize()`
   calls. A never-compacted collection only needs to clear `minBytes`.
+  `skipBusy: true` additionally skips (rather than throws on) any
+  collection with open cursors — what an unattended sweep wants; a busy
+  collection just gets its turn on the next one.
 
-So `db.compact({ minBytes: 1 << 20, factor: 4 })` on a timer (or on
-coordinator-leadership acquisition) approximates "compact anything that
-has quadrupled since last time, ignore anything under a megabyte" — a
-LevelDB-style growth heuristic that self-tunes: a collection whose live
-set genuinely grows raises its own baseline with every compact.
+So `db.compact({ minBytes: 1 << 20, factor: 4 })` on a timer
+approximates "compact anything that has quadrupled since last time,
+ignore anything under a megabyte" — a LevelDB-style growth heuristic
+that self-tunes: a collection whose live set genuinely grows raises its
+own baseline with every compact.
+
+The two moments the engine *does* own are packaged as the `autoCompact`
+connect option:
+
+```js
+const db = await connect(provider, { autoCompact: { minBytes: 1 << 20, factor: 4 } });
+await db.autoCompacted; // optional -- the sweep's results, for tests/telemetry
+```
+
+- **On open**: `Db.open()` schedules one
+  `db.compact({ ...autoCompact, skipBusy: true })` sweep as soon as it
+  completes, without delaying `connect()` — operations issued meanwhile
+  queue per-collection at worst. A failed sweep warns and resolves
+  `db.autoCompacted` to `null`; closing the db mid-sweep quietly
+  abandons it.
+- **On leadership acquisition**: `connectShared` forwards its options to
+  every newly elected leader's `connect()`, so a leadership handover —
+  typically a tab closing, when nobody is mid-interaction — re-runs the
+  sweep on the new leader.
+
+A host that wants more than that (say, an hourly sweep in a long-lived
+worker) still just calls `db.compact({ minBytes, factor, skipBusy: true })`
+on its own schedule.
 
 ## Deliberate non-goals
 
