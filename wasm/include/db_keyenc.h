@@ -9,11 +9,13 @@
  * Only binjson INT/FLOAT (one "number" domain, matching how JS treats every
  * number uniformly), STRING, and (milestone 9, for TTL indexes) DATE values
  * have an order-preserving encoding here — the same scope as the JS
- * primitive being ported, plus DATE. Any other type (including a document
- * missing the field) is BJ_ERR_STATE; extending the domain further (OID, a
- * full BSON-like total order across types, sparse indexes for missing
- * fields — the latter now handled a level up, in db.c's
- * equality_index_applies) is future work, not this port.
+ * primitive being ported, plus DATE. Any other value type is BJ_ERR_STATE
+ * (db.c translates that to DC_ERR_UNINDEXABLE_VALUE at its call sites, and
+ * reports a document missing the field as DC_ERR_MISSING_INDEXED_FIELD
+ * itself); extending the domain further (OID, a full BSON-like total order
+ * across types, sparse indexes for missing fields — the latter now handled
+ * a level up, in db.c's equality_index_applies) is future work, not this
+ * port.
  *
  * Wire shape of one encoded key, built by calling qk_put_value once per
  * indexed field (in index order) followed by exactly one qk_put_id:

@@ -457,11 +457,14 @@ Tracked in detail in `docs/db-plan.md`; summarized here:
   deliberately not implemented; would be the single biggest chunk of new
   execution code in the roadmap, and nothing else depends on it.
 - **Full multi-document transactions** (`startSession`/
-  `withTransaction()`) — only per-document-write atomicity exists (a
+  `withTransaction()`) — only per-document-write atomicity exists: a
   cross-file commit journal ensures one document's primary-tree write and
-  all its index updates land together). Real sessions would need a
-  journal spanning multiple collections at once plus a JS-side session
-  object buffering operations until commit.
+  all its index updates land together across a crash, and a failed write
+  (e.g. a document missing a non-sparse indexed field, or a unique-key
+  conflict) rewinds every file in-process, so a rejection never leaves a
+  half-applied document visible. Real sessions would need a journal
+  spanning multiple collections at once plus a JS-side session object
+  buffering operations until commit.
 - **MongoDB's null-matches-missing quirk** and **full cross-BSON-type
   ordering** — a missing field never equality-matches a literal `null`;
   ordering comparisons only work within one domain (number/string/Date).

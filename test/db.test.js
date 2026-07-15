@@ -397,9 +397,68 @@ describe('db: secondary indexes (milestone 2)', () => {
     await users.insertOne({ name: 'Ada', team: 'core' });
     await users.insertOne({ name: 'NoTeam' }); // missing `team`
 
-    await expect(users.createIndex({ team: 1 })).rejects.toThrow();
+    await expect(users.createIndex({ team: 1 })).rejects.toThrow(/missing a field required by a non-sparse index/);
     expect(await users.listIndexes()).toEqual([]);
     // The collection itself must still be fully usable after the failed attempt.
+    expect(await users.countDocuments()).toBe(2);
+    await db.close();
+  });
+
+  it('reports a write missing a non-sparse indexed field as exactly that (DC_ERR_MISSING_INDEXED_FIELD)', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    await users.createIndex({ team: 1 });
+    await users.insertOne({ name: 'Ada', team: 'core' });
+
+    // insert, and an update that removes the field, both trip the same
+    // index-maintenance check -- and must say so, not "builder state error".
+    await expect(users.insertOne({ name: 'NoTeam' }))
+      .rejects.toThrow(/missing a field required by a non-sparse index/);
+    await expect(users.updateOne({ name: 'Ada' }, { $unset: { team: '' } }))
+      .rejects.toThrow(/missing a field required by a non-sparse index/);
+
+    // Nothing landed: the failed writes rolled back whole.
+    expect(await users.countDocuments()).toBe(1);
+    expect((await users.findOne({ name: 'Ada' })).team).toBe('core');
+    await db.close();
+  });
+
+  it('reports an unindexable indexed-field value as exactly that (DC_ERR_UNINDEXABLE_VALUE)', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    await users.createIndex({ team: 1 });
+
+    // A boolean has no order-preserving key encoding (db_keyenc.h).
+    await expect(users.insertOne({ name: 'Bool', team: true }))
+      .rejects.toThrow(/cannot be key-encoded/);
+    // Same for a lookup value on the read side.
+    await expect(users.findByIndex('team_1', [true]))
+      .rejects.toThrow(/cannot be key-encoded/);
+    expect(await users.countDocuments()).toBe(0);
+    await db.close();
+  });
+
+  it('a failed write rolls back in-process, not just on reopen', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    await users.createIndex({ email: 1 }, { unique: true });
+    await users.insertOne({ name: 'Ada', email: 'ada@example.com' });
+    await users.insertOne({ name: 'Grace', email: 'grace@example.com' });
+
+    // A unique-key rejection is discovered only after the matched
+    // document's old index entries were cleared (see dc_replace_one's
+    // check placement); the rewind must restore them in the live session.
+    await expect(users.updateOne({ name: 'Grace' }, { $set: { email: 'ada@example.com' } }))
+      .rejects.toThrow(/unique index/);
+    expect((await users.findByIndex('email_1', ['grace@example.com'])).map(d => d.name)).toEqual(['Grace']);
+    expect((await users.findOne({ name: 'Grace' })).email).toBe('grace@example.com');
+
+    // Same for replaceOne, and for updateMany stopping mid-run: documents
+    // it already committed stay, the failing one rolls back whole.
+    await expect(users.replaceOne({ name: 'Grace' }, { name: 'Grace', email: 'ada@example.com' }))
+      .rejects.toThrow(/unique index/);
+    expect((await users.findByIndex('email_1', ['grace@example.com'])).map(d => d.name)).toEqual(['Grace']);
+
     expect(await users.countDocuments()).toBe(2);
     await db.close();
   });

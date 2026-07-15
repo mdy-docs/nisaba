@@ -67,7 +67,16 @@
  * rather than leaving them permanently out of sync. This generalizes
  * textindex.c's fixed-3-tree journal (docs/textindex-atomicity.md) to a
  * variable number of files; see dc_collection_recover's doc comment below
- * and docs/db-plan.md milestone 5 for the full design. Scope note: this is
+ * and docs/db-plan.md milestone 5 for the full design.
+ *
+ * In-process atomicity: the same writes are also atomic against *failure
+ * without a crash* — an error partway through (an index rejecting a
+ * document, a unique-key conflict discovered after the old entries were
+ * cleared, OOM) rewinds every file to its pre-operation length before the
+ * error is returned (mut_begin/mut_end in db.c, built on the same
+ * bpt_rewind primitive recovery uses), so the live session never observes
+ * a half-applied write. This holds with or without a journal — the rewind
+ * lengths come from the live trees. Scope note: this is
  * per-document-write atomicity, not multi-document ACID transactions/
  * sessions — dc_update_many's documents are not atomic *with each other*,
  * matching real MongoDB's own non-session updateMany semantics. Index
@@ -104,6 +113,16 @@ extern "C" {
 /* A write's field values collide with another document's on a unique
  * index (milestone 9). */
 #define DC_ERR_DUPLICATE_KEY (-12)
+/* A document is missing a field required by a non-sparse equality index —
+ * on write maintenance or createIndex backfill. The rejection itself is
+ * the documented all-or-nothing contract (create the index with `sparse`
+ * to skip such documents); this code exists so it surfaces as what it is
+ * rather than as db_keyenc.h's generic BJ_ERR_STATE. */
+#define DC_ERR_MISSING_INDEXED_FIELD (-13)
+/* An indexed field's value has no order-preserving key encoding
+ * (db_keyenc.h: number/string/Date only; no NaN, no strings containing
+ * U+0000). Same rationale as DC_ERR_MISSING_INDEXED_FIELD. */
+#define DC_ERR_UNINDEXABLE_VALUE (-14)
 
 typedef struct dc_collection dc_collection;
 
@@ -161,7 +180,8 @@ int dc_collection_recover(dc_collection *c, const bj_io *journal);
  * All-or-nothing unless `sparse`/`partial_filter` says otherwise: a
  * document missing one of `fields` (and not skipped by `sparse`), holding
  * a non-number/string value for one, or colliding with another document's
- * values on a `unique` index, fails the whole call (BJ_ERR_STATE /
+ * values on a `unique` index, fails the whole call
+ * (DC_ERR_MISSING_INDEXED_FIELD / DC_ERR_UNINDEXABLE_VALUE /
  * DC_ERR_DUPLICATE_KEY) and leaves `c` without the index registered (the
  * caller should discard `index_tree`'s file) — matching MongoDB's own
  * index-build failure behavior, including refusing to build a `unique`
@@ -293,7 +313,9 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
  * outlive a single request (paged over multiple separate calls, as the
  * cloud service's REST cursor protocol does) needs the caller to keep
  * that window short or avoid compacting a collection with cursors open
- * against it -- not enforced at this layer today.
+ * against it. Not enforced at this C layer; the JS Collection.compact()
+ * refuses to run while it has open cursors (wasm/nisaba-wasm.js,
+ * docs/compaction.md).
  */
 typedef struct dc_cursor dc_cursor;
 

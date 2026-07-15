@@ -268,6 +268,46 @@ static int commit_journal(dc_collection *c) {
     return w ? (int)w : BJ_OK;
 }
 
+/*
+ * In-process rollback for a failed multi-file mutation: capture every
+ * backing file's committed length before the first write, and rewind all
+ * files back to those lengths if the operation errors partway. This is the
+ * live-session counterpart of dc_collection_recover's reopen-time rewind:
+ * without it a failed write (say, DC_ERR_MISSING_INDEXED_FIELD from
+ * add_to_indexes after the primary tree already took the document, or a
+ * DC_ERR_DUPLICATE_KEY rejection after remove_from_indexes already cleared
+ * the old entries) would leave the live collection inconsistent until the
+ * next open. Safe with concurrently open cursors: they pin roots at commit
+ * boundaries at or below the captured lengths, which the rewind never
+ * truncates away.
+ *
+ * No capture (NULL lens, still BJ_OK) when the collection has no secondary
+ * indexes -- a single-file bpt operation already discards its pending
+ * appends on failure, leaving the file untouched. Works with or without a
+ * journal: the lengths come from the live trees, not the journal.
+ */
+static int mut_begin(dc_collection *c, uint64_t **lens) {
+    *lens = NULL;
+    if (c->index_count == 0) return BJ_OK;
+    uint64_t *l = (uint64_t *)malloc(dctj_file_count(c) * sizeof(uint64_t));
+    if (!l) return BJ_ERR_OOM;
+    dctj_gather_lens(c, l);
+    *lens = l;
+    return BJ_OK;
+}
+
+/* Finish a mutation begun with mut_begin: on error, best-effort rewind of
+ * every file to its captured length. The original error is returned either
+ * way -- if the rewind itself fails (host I/O), the journal still heals the
+ * state at the next open, exactly as if the process had crashed here. */
+static int mut_end(dc_collection *c, uint64_t *lens, int e) {
+    if (lens) {
+        if (e) (void)dctj_rewind_all(c, lens);
+        free(lens);
+    }
+    return e;
+}
+
 int dc_collection_recover(dc_collection *c, const bj_io *journal) {
     if (!journal) { c->has_journal = 0; return BJ_OK; }
     c->journal = *journal;
@@ -610,8 +650,12 @@ static int build_index_key_prefix(const dc_index *ix, const uint8_t *doc, size_t
         const uint8_t *vp; size_t vlen; int found;
         int e = obj_get_field(doc, doc_len, ix->field_names[i], ix->field_name_lens[i], &vp, &vlen, &found);
         if (e) return e;
-        if (!found) return BJ_ERR_STATE; /* indexed field missing from this document */
+        if (!found) return DC_ERR_MISSING_INDEXED_FIELD;
         e = qk_put_value(out, vp, vlen);
+        /* qk_put_value's generic BJ_ERR_STATE means "no ordered encoding for
+         * this value" here -- surface that as its own code (OOM etc. pass
+         * through unchanged). */
+        if (e == BJ_ERR_STATE) return DC_ERR_UNINDEXABLE_VALUE;
         if (e) return e;
     }
     return BJ_OK;
@@ -630,7 +674,7 @@ static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_le
 /* Whether `doc` should have an entry in equality index `ix`, per its
  * sparse/partialFilterExpression options. Does NOT gate on a missing field
  * for a non-sparse index -- that stays build_index_key's existing
- * all-or-nothing BJ_ERR_STATE, unchanged. */
+ * all-or-nothing DC_ERR_MISSING_INDEXED_FIELD, unchanged. */
 static int equality_index_applies(const dc_index *ix, const uint8_t *doc, size_t doc_len, int *applies) {
     *applies = 1;
     if (ix->partial_filter) {
@@ -864,6 +908,10 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
         size_t vstart = vc.pos;
         e = skip_value(&vc);
         if (!e) e = qk_put_value(&prefix, vc.d + vstart, vc.pos - vstart);
+        /* Same translation as build_index_key_prefix: a lookup value with no
+         * ordered encoding is DC_ERR_UNINDEXABLE_VALUE, not a generic
+         * BJ_ERR_STATE. */
+        if (e == BJ_ERR_STATE) e = DC_ERR_UNINDEXABLE_VALUE;
     }
     if (e) { dbuf_free(&prefix); return e; }
 
@@ -1516,11 +1564,13 @@ int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
     if (found) return DC_ERR_DUPLICATE;
     e = check_unique_indexes(c, doc, doc_len);
     if (e) return e;
+    uint64_t *undo;
+    e = mut_begin(c, &undo);
+    if (e) return e;
     e = bpt_add(c->primary, &key, doc, doc_len);
-    if (e) return e;
-    e = add_to_indexes(c, doc, doc_len, id);
-    if (e) return e;
-    return commit_journal(c);
+    if (!e) e = add_to_indexes(c, doc, doc_len, id);
+    if (!e) e = commit_journal(c);
+    return mut_end(c, undo, e);
 }
 
 int dc_insert_many(dc_collection *c, const uint8_t *docs, uint32_t docs_len,
@@ -1866,14 +1916,18 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
 
     uint8_t id[12];
     e = dc_get_id(doc, (uint32_t)doc_len, id);
-    if (!e) e = remove_from_indexes(c, doc, doc_len, id);
     if (e) { free(doc); return e; }
-
-    bpt_key key; oid_key(id, &key);
-    e = bpt_delete(c->primary, &key);
+    uint64_t *undo;
+    e = mut_begin(c, &undo);
+    if (e) { free(doc); return e; }
+    e = remove_from_indexes(c, doc, doc_len, id);
     free(doc);
-    if (e) return e;
-    e = commit_journal(c);
+    if (!e) {
+        bpt_key key; oid_key(id, &key);
+        e = bpt_delete(c->primary, &key);
+    }
+    if (!e) e = commit_journal(c);
+    e = mut_end(c, undo, e);
     if (e) return e;
     *deleted = 1;
     return BJ_OK;
@@ -1889,12 +1943,17 @@ int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     for (size_t i = 0; !e && i < match_count; i++) {
         uint8_t id[12];
         e = dc_get_id(matches[i].ptr, (uint32_t)matches[i].len, id);
-        if (!e) e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
+        if (e) break;
+        uint64_t *undo;
+        e = mut_begin(c, &undo);
+        if (e) break;
+        e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
         if (!e) {
             bpt_key key; oid_key(id, &key);
             e = bpt_delete(c->primary, &key);
         }
         if (!e) e = commit_journal(c);
+        e = mut_end(c, undo, e);
         if (!e) (*deleted_count)++;
     }
 
@@ -2010,21 +2069,27 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     e = splice_id(replacement, replacement_len, existing_id, &spliced, &spliced_len);
     if (e) { free(doc); return e; }
 
+    uint64_t *undo;
+    e = mut_begin(c, &undo);
+    if (e) { free(doc); free(spliced); return e; }
+
     e = remove_from_indexes(c, doc, doc_len, existing_id);
     free(doc);
-    if (e) { free(spliced); return e; }
 
     /* Checked here, after the old entries are cleared (so nothing self-
      * conflicts) but before the primary tree sees the new content -- a
-     * rejection must never leave a forbidden duplicate value in primary. */
-    e = check_unique_indexes(c, spliced, spliced_len);
-    if (e) { free(spliced); return e; }
+     * rejection must never leave a forbidden duplicate value in primary.
+     * mut_end's rewind restores the just-removed entries on rejection. */
+    if (!e) e = check_unique_indexes(c, spliced, spliced_len);
 
-    bpt_key key; oid_key(existing_id, &key);
-    e = bpt_add(c->primary, &key, spliced, (uint32_t)spliced_len);
+    if (!e) {
+        bpt_key key; oid_key(existing_id, &key);
+        e = bpt_add(c->primary, &key, spliced, (uint32_t)spliced_len);
+    }
     if (!e) e = add_to_indexes(c, spliced, (uint32_t)spliced_len, existing_id);
     if (!e) e = commit_journal(c);
     free(spliced);
+    e = mut_end(c, undo, e);
     if (e) return e;
     *result = 1;
     return BJ_OK;
@@ -2152,18 +2217,24 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     e = upd_apply(doc, doc_len, update, update_len, 0, &updated, &updated_len);
     if (e) { free(doc); free(updated); return e; }
 
+    uint64_t *undo;
+    e = mut_begin(c, &undo);
+    if (e) { free(doc); free(updated); return e; }
+
     e = remove_from_indexes(c, doc, doc_len, id);
     free(doc);
-    if (e) { free(updated); return e; }
 
-    e = check_unique_indexes(c, updated, updated_len);
-    if (e) { free(updated); return e; }
+    /* Same placement rationale (and mut_end restore) as dc_replace_one's. */
+    if (!e) e = check_unique_indexes(c, updated, updated_len);
 
-    bpt_key key; oid_key(id, &key);
-    e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
+    if (!e) {
+        bpt_key key; oid_key(id, &key);
+        e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
+    }
     if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
     if (!e) e = commit_journal(c);
     free(updated);
+    e = mut_end(c, undo, e);
     if (e) return e;
     *result = 1;
     return BJ_OK;
@@ -2250,6 +2321,9 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             uint8_t *updated = NULL; size_t updated_len = 0;
             e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, 0, &updated, &updated_len);
             if (e) { free(updated); break; }
+            uint64_t *undo;
+            e = mut_begin(c, &undo);
+            if (e) { free(updated); break; }
             e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
             if (!e) e = check_unique_indexes(c, updated, updated_len);
             if (!e) {
@@ -2259,6 +2333,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
             if (!e) e = commit_journal(c);
             free(updated);
+            e = mut_end(c, undo, e);
         }
     }
 

@@ -68,7 +68,9 @@ const ERR = {
   [-9]: 'Argument out of range',
   [-10]: 'Duplicate _id',
   [-11]: 'replaceOne cannot change the _id of an existing document',
-  [-12]: 'Duplicate key: a unique index already has a document with these field values'
+  [-12]: 'Duplicate key: a unique index already has a document with these field values',
+  [-13]: 'Document is missing a field required by a non-sparse index (create the index with sparse: true to skip such documents)',
+  [-14]: 'Indexed field value cannot be key-encoded: only numbers, strings, and Dates are indexable (no NaN, no strings containing U+0000)'
 };
 
 const textEncoder = new TextEncoder();
