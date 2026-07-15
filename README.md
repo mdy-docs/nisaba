@@ -71,3 +71,13 @@ const core = await users.find({ team: 'core' }).toArray();
 for real browser/Worker persistence). `connectClient(provider)` opens a
 `Client` with multiple independently named databases, each its own
 isolated storage scope — see `Client.db(name)`.
+
+## Documentation
+
+- [`docs/db-api.md`](docs/db-api.md) — complete JS-facing API reference.
+- [`docs/db-example.js`](docs/db-example.js) — a runnable, narrated tour of
+  most of that API (`node docs/db-example.js`).
+- [`docs/db-plan.md`](docs/db-plan.md) — milestone-by-milestone design
+  history and scope decisions (historical; see the note at its top).
+- [`docs/textindex-atomicity.md`](docs/textindex-atomicity.md) — how the
+  text index stays atomic across its backing files.
