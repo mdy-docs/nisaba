@@ -83,13 +83,16 @@
   </div>
 
   <script type="module">
-    // db.js -- this package's public entry point, exercised here exactly as
-    // any other project consuming nisaba would: the pure-JS (no WASM) codec
-    // for marshaling postMessage payloads (this thread never calls ready(),
-    // so it shouldn't pay for a WASM instantiation just to encode/decode),
-    // and createRemoteBridge for wrapping a Worker's RPC handle as a
-    // local-feeling proxy (see db.js's own doc comment for both).
-    import { encode, decode, ObjectId, Pointer, createRemoteBridge } from './src/db.js';
+    // db-remote.js -- this package's main-thread entry point (`nisaba/remote`),
+    // exercised here exactly as any other project consuming nisaba would: the
+    // pure-JS (no WASM) codec for marshaling postMessage payloads (this thread
+    // never calls ready(), so it shouldn't pay for the WASM module graph just
+    // to encode/decode), and createRemoteBridge for wrapping a Worker's RPC
+    // handle as a local-feeling proxy (see db-remote.js's own doc comments).
+    // Deliberately NOT './src/db.js': that full entry statically re-exports
+    // from wasm/nisaba-wasm.js, which would load ~160 KB of WASM-glue JS on
+    // this thread that it never uses.
+    import { encode, decode, ObjectId, Pointer, createRemoteBridge } from './src/db-remote.js';
 
     const worker = new Worker(new URL('./src/db-worker.js', import.meta.url), { type: 'module' });
     let nextId = 1;
@@ -117,7 +120,7 @@
     }
 
     // --- Generic console bridge: window.client, backed by db-worker.js's
-    // generic RPC handler (rpcInvoke) via db.js's createRemoteBridge.
+    // generic RPC handler (rpcInvoke) via db-remote.js's createRemoteBridge.
     // `'client'` is the plain multi-database Client itself, reserved by
     // db-worker.js -- see its own header comment for why this deliberately
     // isn't the same connection the notes UI below uses (this bridge has no

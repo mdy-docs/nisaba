@@ -6,6 +6,7 @@
   "main": "src/db.js",
   "exports": {
     ".": "./src/db.js",
+    "./remote": "./src/db-remote.js",
     "./wasm": "./wasm/nisaba-wasm.js",
     "./coordinator": "./src/db-coordinator.js"
   },
