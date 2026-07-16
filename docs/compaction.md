@@ -148,16 +148,23 @@ queues:
   hazard `db.h` documents for `dc_cursor`), and a paused iteration can
   be held indefinitely, so waiting for it could never be bounded.
 - While a compact is in flight, **every other operation on that
-  collection waits for it** and then runs against the new generation
-  (`_compacting` in `wasm/nisaba-wasm.js` — each public entry point
-  opens with an inline gate loop; the field's doc comment explains why
-  it must be inlined rather than shared as a helper). Interleaving is
-  what the gate exists to prevent: a mutation during the build phase
-  would make the new generation internally inconsistent — the files
-  are streamed one at a time — and a read during the adopt phase would
-  touch freed WASM handles. The wait is bounded by the one compact
-  (back-to-back `compact()` calls serialize the same way), so to any
-  concurrent caller a compact is a brief latency blip, never an error.
+  collection waits for it** and then runs against the new generation,
+  and symmetrically **a compact waits for every in-flight operation to
+  drain** before touching a file (`_compacting`/`_inFlight` in
+  `wasm/nisaba-wasm.js` — a prototype wrapper applies the gate + count
+  to every public method in one place; the constructor comment carries
+  the invariants). Interleaving is what this exists to prevent in both
+  directions: a mutation during the build phase would make the new
+  generation internally inconsistent — the files are streamed one at a
+  time — and a read during the adopt phase would touch freed WASM
+  handles; conversely an operation that awaits internally mid-body
+  (e.g. resolving a watch documentKey) must never have a compact start
+  inside that window. The gate is only ever taken at a drained instant,
+  which is also what makes re-entrant internal calls (bulkWrite →
+  insertOne, pruneExpired → deleteMany) deadlock-free by construction.
+  The wait is bounded by the one compact (back-to-back `compact()`
+  calls serialize the same way), so to any concurrent caller a compact
+  is a brief latency blip, never an error.
 - Under `connectShared`, `compact` is an ordinary proxied method: only
   the leader holds files, so the swap happens where the handles live,
   and a follower RPC that races it queues on the leader like any local

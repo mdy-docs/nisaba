@@ -50,6 +50,11 @@ import { encode, decode, connect, ChangeStream } from '../wasm/nisaba-wasm.js';
 const REQUEST_TIMEOUT_MS = 5000;
 const REELECT_WAIT_MS = 2000;
 const HEARTBEAT_INTERVAL_MS = 2000;
+// Completed request replies the leader keeps for replay (see
+// _handleRequest's dedup). Sized for "every tab retried at once", not for
+// history: a retry arrives within one REQUEST_TIMEOUT_MS + REELECT_WAIT_MS
+// window, during which even a busy leader sees far fewer distinct requests.
+const RPC_REPLY_CACHE = 128;
 
 function lockName(dbName) { return `binjson-db-lock:${dbName}`; }
 function channelName(dbName) { return `binjson-db-coord:${dbName}`; }
@@ -91,6 +96,7 @@ class Coordinator {
     this._closed = false;
     this._rebroadcasting = new Set(); // collection names already subscribed for rebroadcast (leader only)
     this._changeListeners = new Map(); // collectionName -> Set<ChangeStream>, this context's own watch() callers
+    this._rpcReplies = new Map(); // requestId -> Promise<{type, payload}>, leader-side replay cache (see _handleRequest)
 
     this.channel.addEventListener('message', (event) => this._onMessage(event.data));
   }
@@ -195,11 +201,45 @@ class Coordinator {
     }
   }
 
+  /**
+   * Exactly-once against THIS leader: a follower whose request timed out
+   * retries with the same requestId (see _rpcCall), so the leader keeps a
+   * bounded map of requestId -> reply promise and replays rather than
+   * re-executes -- covering both a request whose response got lost after
+   * executing AND one still executing when the retry lands (the in-flight
+   * promise is shared, never a second execution). The one remaining
+   * at-most-once hole is a leadership change: a new leader has an empty
+   * cache, and whether the dead leader's execution reached disk is
+   * genuinely unknowable from here -- the same ambiguity every
+   * failover-retry design has without a durable session log.
+   */
   async _handleRequest(msg) {
-    const [collectionName, method, args] = decode(msg.payload);
+    let reply = this._rpcReplies.get(msg.requestId);
+    if (!reply) {
+      reply = this._executeRequest(msg.payload);
+      this._rpcReplies.set(msg.requestId, reply);
+      reply.then(() => {
+        // Trim oldest beyond the cap only once settled -- Map preserves
+        // insertion order, so the front is the stalest.
+        if (this._rpcReplies.size <= RPC_REPLY_CACHE) return;
+        for (const id of this._rpcReplies.keys()) {
+          if (this._rpcReplies.size <= RPC_REPLY_CACHE) break;
+          this._rpcReplies.delete(id);
+        }
+      });
+    }
+    const { type, payload } = await reply;
+    this.channel.postMessage({ type, requestId: msg.requestId, payload });
+  }
+
+  /** Run one decoded request to a posted-message shape. Never rejects:
+   * errors become the wire's 'error' reply, so _rpcReplies can replay
+   * them identically. */
+  async _executeRequest(payload) {
+    const [collectionName, method, args] = decode(payload);
     try {
       const result = await executeOnRealDb(this.realDb, collectionName, method, args, this);
-      this.channel.postMessage({ type: 'response', requestId: msg.requestId, payload: encode(result === undefined ? null : result) });
+      return { type: 'response', payload: encode(result === undefined ? null : result) };
     } catch (err) {
       // Flatten the partial-failure side channel some methods attach
       // (insertMany's err.result, bulkWrite's err.result/err.writeErrors)
@@ -209,7 +249,7 @@ class Coordinator {
       const info = { message: err.message };
       if (err.result !== undefined) info.result = err.result;
       if (err.writeErrors) info.writeErrors = err.writeErrors.map((w) => ({ index: w.index, message: w.error?.message ?? String(w.error) }));
-      this.channel.postMessage({ type: 'error', requestId: msg.requestId, payload: encode(info) });
+      return { type: 'error', payload: encode(info) };
     }
   }
 
@@ -237,27 +277,30 @@ class Coordinator {
   }
 
   /** Backs SharedCollection.watch(). */
-  watch(collectionName) {
+  watch(collectionName, options = {}) {
     const stream = new ChangeStream(() => {
       const set = this._changeListeners.get(collectionName);
       if (!set) return;
       set.delete(stream);
       if (set.size === 0) this._changeListeners.delete(collectionName);
-    });
+    }, { maxBuffered: options.maxBuffered });
     let set = this._changeListeners.get(collectionName);
     if (!set) { set = new Set(); this._changeListeners.set(collectionName, set); }
     set.add(stream);
     return stream;
   }
 
-  async _rpcCall(collectionName, method, args, retried = false) {
+  async _rpcCall(collectionName, method, args, retried = false, requestId = null) {
     // Re-checked on every (re)entry, not just in dispatch(): if this very
     // context was promoted to leader while an earlier attempt was in
     // flight, a broadcast request it sent as a follower will never be
     // answered (BroadcastChannel never delivers a context's own messages
     // back to itself) -- serve locally instead of retrying over the wire.
     if (this.role === 'leader') return executeOnRealDb(this.realDb, collectionName, method, args, this);
-    const requestId = crypto.randomUUID();
+    // Kept identical across the one retry, so a leader that DID execute
+    // the first attempt (response lost / just slow) replays its reply
+    // from _rpcReplies instead of running the operation twice.
+    if (!requestId) requestId = crypto.randomUUID();
     const payload = encode([collectionName, method, args]);
     const result = new Promise((resolve, reject) => this.pending.set(requestId, { resolve, reject }));
     this.channel.postMessage({ type: 'request', requestId, payload });
@@ -277,14 +320,15 @@ class Coordinator {
       // Retry ONLY when nothing answered (rpcTimeout): the leader may be
       // gone (its tab/worker closed), so re-broadcast, give a new leader a
       // bounded window to appear (another follower's announce, or our own
-      // lock finally being granted), and retry once. An error *response*
-      // means the leader is alive and the operation genuinely failed --
-      // retrying would re-execute a non-idempotent operation that already
-      // partially ran (e.g. insertMany's successfully inserted prefix).
+      // lock finally being granted), and retry once -- with the SAME
+      // requestId, so a leader that actually executed the first attempt
+      // replays its cached reply (_handleRequest) rather than re-running
+      // a non-idempotent operation. An error *response* means the leader
+      // is alive and the operation genuinely failed -- never retried.
       if (!err.rpcTimeout || retried) throw err;
       this.channel.postMessage({ type: 'whoIsLeader' });
       await this._waitForLeaderSignal(REELECT_WAIT_MS);
-      return this._rpcCall(collectionName, method, args, true);
+      return this._rpcCall(collectionName, method, args, true, requestId);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -301,6 +345,7 @@ class Coordinator {
     if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
     for (const { reject } of this.pending.values()) reject(new Error('db-coordinator: closed'));
     this.pending.clear();
+    this._rpcReplies.clear();
     for (const set of this._changeListeners.values()) {
       for (const stream of [...set]) stream.close();
     }
@@ -409,7 +454,7 @@ class SharedCollection {
     if (pipeline.length) {
       throw new Error('SharedCollection.watch: pipeline stages are not supported yet');
     }
-    return this._coord.watch(this.name);
+    return this._coord.watch(this.name, options);
   }
 }
 
@@ -425,6 +470,12 @@ class SharedDb {
   async listCollections() { return this._coord.dispatch(null, 'listCollections', []); }
   async dropCollection(name) { return this._coord.dispatch(null, 'dropCollection', [name]); }
   async compact(options = {}) { return this._coord.dispatch(null, 'compact', [options]); }
+  /** Same as Db.storageEstimate(). Quota is origin-wide, so it's answered
+   * locally rather than proxied to the leader. */
+  async storageEstimate() {
+    if (typeof navigator === 'undefined' || !navigator.storage || typeof navigator.storage.estimate !== 'function') return null;
+    return navigator.storage.estimate();
+  }
   async close() { return this._coord.close(); }
 }
 

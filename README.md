@@ -84,6 +84,8 @@ isolated storage scope — see `Client.db(name)`.
 - [`docs/compaction.md`](docs/compaction.md) — how `compact()` reclaims
   the space append-only storage costs, via an atomic catalog-commit swap
   of a collection's whole file set.
+- [`docs/format-compatibility.md`](docs/format-compatibility.md) — the
+  on-disk format version stamp and the rules for ever changing it.
 - [`docs/roadmap.md`](docs/roadmap.md) — honest appraisal of where the
   project stands and the prioritized productization plan (types, named
   errors, a native Node storage provider, CI, and the remaining known

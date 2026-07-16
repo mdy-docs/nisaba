@@ -136,7 +136,16 @@ before any open need it.
 
 ## P1 — the remaining known correctness/robustness holes
 
-### 7. Leader-side RPC dedup (exactly-once for retried requests)
+**Status: all six items landed 2026-07-16** (engine: `_inFlight` drain +
+prototype wrapper, `cursorFinalizer`, bounded ChangeStream, `bridgeHandle`
++ `storageEstimate()`, format stamp; coordinator: `_rpcReplies` replay
+cache). The quota work also fixed a real durability bug found while
+writing the test: a QuotaExceededError thrown through the WASM frames
+left a phantom document that the next successful write committed
+durably — `bridgeHandle` now converts handle exceptions into the
+bridge's short-write error contract so C rolls back in-process.
+
+### 7. Leader-side RPC dedup (exactly-once for retried requests) ✅
 
 `db-coordinator.js` retries a timed-out request once — but if the first
 request actually executed and only the response was lost, a
@@ -145,7 +154,7 @@ site acknowledges this). Standard fix: leader caches recent
 `requestId → response` and replays instead of re-executing; a bounded
 LRU (say, last 128) is plenty at BroadcastChannel scale.
 
-### 8. Compact vs in-flight ops: the op counter
+### 8. Compact vs in-flight ops: the op counter ✅
 
 The compaction gate queues operations *issued* mid-compact
 (`_compacting`, inlined loop — see its doc comment for why inlined).
@@ -157,7 +166,7 @@ increment an in-flight counter after passing the gate (try/finally),
 and `compact()` waits for it to drain before setting `_compacting`.
 This closes the last known concurrency hole.
 
-### 9. Quota exhaustion: test it and surface it
+### 9. Quota exhaustion: test it and surface it ✅
 
 The most likely real-world browser failure — OPFS `QuotaExceededError`
 mid-multi-file write — has no test. Add a wrapping provider whose
@@ -166,7 +175,7 @@ recovery leave the collection consistent. Expose a
 `db.storageEstimate()` convenience (wraps `navigator.storage.estimate()`
 where available) so hosts can warn before writes start failing.
 
-### 10. Abandoned cursors
+### 10. Abandoned cursors ✅
 
 An unexhausted, unclosed `find()` cursor blocks `compact()` forever and
 pins WASM memory. Add a `FinalizationRegistry` safety net that frees
@@ -175,7 +184,7 @@ document `close()` as required for early-abandoned streaming cursors
 (braces). autoCompact's `skipBusy` already tolerates them; this is
 about not leaking forever.
 
-### 11. ChangeStream backpressure
+### 11. ChangeStream backpressure ✅
 
 `_emit` pushes to an unbounded `_queue` when a consumer is slower than
 the write rate — and the coordinator rebroadcasts every change to every
@@ -184,7 +193,7 @@ thousand) that on overflow closes the stream with a
 `ChangeStreamOverflowError`. No silent unbounded growth, no silent
 drops. (Resume tokens are a non-goal for now; say so.)
 
-### 12. On-disk format compatibility contract
+### 12. On-disk format compatibility contract ✅
 
 The journal has magic+version and B+ tree metadata carries
 `version: 1`, but nothing documents what v2 code does with v1 files or

@@ -288,6 +288,86 @@ describe('db: collection compaction', () => {
     await db.close();
   });
 
+  it('compact() waits for an in-flight operation with internal awaits to drain', async () => {
+    const provider = new MemoryStorageProvider();
+    const { db, users, survivors } = await seedUsers(provider);
+    // A watcher gives deleteOne an internal await (documentKey resolution
+    // via findOne) between entering the critical section and mutating --
+    // exactly the window a compact() must not start inside.
+    const stream = users.watch();
+
+    const settled = [];
+    const deleting = users.deleteOne({ i: 1 }).then(() => settled.push('delete'));
+    const compacting = users.compact().then(() => settled.push('compact'));
+    // deleteOne is counted in-flight, so compact() must be parked in its
+    // drain wait with the gate still open -- not building.
+    expect(users._compacting).toBeNull();
+    expect(users._inFlight).toBeGreaterThan(0);
+
+    await Promise.all([deleting, compacting]);
+    expect(settled).toEqual(['delete', 'compact']);
+    expect(await users.findOne({ i: 1 })).toBeNull();
+    expect(await users.countDocuments({})).toBe(survivors.length - 1);
+    // The delete landed in the pre-compact generation: its index entries
+    // are consistent in the compacted files.
+    expect((await users.find({ i: 1 }).toArray())).toEqual([]);
+    stream.close();
+    await db.close();
+  });
+
+  it('re-entrant operations (bulkWrite nesting other ops) never deadlock against a queued compact', async () => {
+    const provider = new MemoryStorageProvider();
+    const { db, users, survivors } = await seedUsers(provider);
+    const doc = (i) => ({ i, team: 'bulk', bio: `bulk number${i}`, loc: point(1, 1) });
+
+    // Issued together in one tick: bulkWrite's inner insertOne/deleteOne
+    // calls re-enter the critical section while compact() waits to drain.
+    const bulk = users.bulkWrite([
+      { insertOne: { document: doc(1001) } },
+      { insertOne: { document: doc(1002) } },
+      { deleteOne: { filter: { i: 1001 } } }
+    ]);
+    const compacting = users.compact();
+    const [bulkResult, stats] = await Promise.all([bulk, compacting]);
+
+    expect(bulkResult.insertedCount).toBe(2);
+    expect(bulkResult.deletedCount).toBe(1);
+    expect(stats.generation).toBe(1);
+    expect(await users.countDocuments({})).toBe(survivors.length + 1);
+    expect((await users.findOne({ i: 1002 })).team).toBe('bulk');
+    await db.close();
+  });
+
+  it('an abandoned, unexhausted cursor is eventually reclaimed by GC so compact() can proceed', async () => {
+    // Exercises the cursorFinalizer safety net (wasm/nisaba-wasm.js);
+    // requires --expose-gc (vitest.config.js passes it) and tolerates
+    // FinalizationRegistry's lazy timing by polling.
+    if (typeof globalThis.gc !== 'function') return; // no gc hook -- covered only where exposed
+    const provider = new MemoryStorageProvider();
+    const db = await connect(provider);
+    const users = await db.collection('users');
+    await users.insertMany(Array.from({ length: 250 }, (_, i) => ({ i })));
+
+    await (async () => {
+      const cursor = users.find({});
+      await cursor.next(); // opens the WASM-side cursor (250 > one batch)
+      // ...and the cursor is abandoned without close() as this scope exits.
+    })();
+    expect(users._openCursors.size).toBe(1);
+    await expect(users.compact()).rejects.toThrow(/open find\(\) cursors/);
+
+    for (let i = 0; i < 100 && users._openCursors.size > 0; i++) {
+      globalThis.gc();
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(users._openCursors.size).toBe(0); // finalizer freed the dc_cursor and its token
+
+    const stats = await users.compact(); // no longer blocked
+    expect(stats.generation).toBe(1);
+    expect(await users.countDocuments({})).toBe(250);
+    await db.close();
+  });
+
   it('watch() streams stay attached across a compact', async () => {
     const provider = new MemoryStorageProvider();
     const { db, users } = await seedUsers(provider, { indexes: false });

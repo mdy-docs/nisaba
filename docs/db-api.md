@@ -102,6 +102,7 @@ subdirectory per database name.
 | `db.listCollections()` | Array of every collection name in this database. |
 | `db.dropCollection(name)` | Delete a collection and all its indexes/files. Returns `false` if it didn't exist. |
 | `db.compact(options?)` | Compact every collection — see [Compaction](#compaction-compact). `{ minBytes, factor }` skip collections not worth rewriting yet; `{ skipBusy }` skips ones with open cursors. |
+| `db.storageEstimate()` | `navigator.storage.estimate()` where the platform provides it, else `null` — the early-warning knob for quota pressure. A write that does hit quota fails cleanly: the operation is rolled back in-process and the error carries the handle's `QuotaExceededError` as `cause`. |
 | `db.close()` | Close every open collection (and their indexes) and the catalog file. |
 
 ## `Collection`
@@ -284,6 +285,14 @@ stream.close();
 `on('change', cb)` instead). Returns a `ChangeStream`: both an
 EventEmitter-lite (`.on('change', cb)`, `.off(cb)`) and an async iterator
 (`for await`, or manual `.next()` → `{ value, done }`), plus `.close()`.
+
+Backpressure: listeners get every event synchronously and nothing is
+buffered for them; events are buffered only for the iterator side, up to
+`options.maxBuffered` (default 4096) unconsumed events. At the bound the
+stream closes itself and `next()`/`for await` reject with a
+`ChangeStreamOverflowError` — never unbounded growth, never a silent
+drop. There are no resume tokens (a deliberate non-goal): an overflowed
+consumer re-`watch()`es and re-reads current state.
 
 Change event shape:
 

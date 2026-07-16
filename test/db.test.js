@@ -1591,6 +1591,66 @@ describe('db: change streams (watch)', () => {
     await db.close();
   });
 
+  it('a listener-only stream never buffers for the iterator nobody runs', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    const stream = users.watch();
+    const seen = [];
+    stream.on('change', (c) => seen.push(c));
+
+    for (let i = 0; i < 20; i++) await users.insertOne({ i });
+    expect(seen).toHaveLength(20);        // every event delivered...
+    expect(stream._queue).toHaveLength(0); // ...and none buried in a queue forever
+
+    stream.close();
+    await db.close();
+  });
+
+  it('an unconsumed iterator buffer is bounded: overflow closes the stream with a named error', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    const stream = users.watch([], { maxBuffered: 5 });
+
+    // Nobody consumes; the 6th event overflows the 5-slot buffer.
+    for (let i = 0; i < 6; i++) await users.insertOne({ i });
+
+    await expect(stream.next()).rejects.toMatchObject({ name: 'ChangeStreamOverflowError' });
+    await expect(stream.next()).rejects.toMatchObject({ name: 'ChangeStreamOverflowError' }); // sticky
+    // The stream closed itself: later writes emit nothing to it.
+    await users.insertOne({ i: 99 });
+    expect(stream._queue).toHaveLength(0);
+
+    // for-await surfaces the same error.
+    const stream2 = users.watch([], { maxBuffered: 2 });
+    for (let i = 0; i < 3; i++) await users.insertOne({ i });
+    await expect((async () => {
+      for await (const change of stream2) void change;
+    })()).rejects.toMatchObject({ name: 'ChangeStreamOverflowError' });
+
+    await db.close();
+  });
+
+  it('a mixed consumer (listener + iterator) still sees every event on the iterator side', async () => {
+    const db = await openDb();
+    const users = await db.collection('users');
+    const stream = users.watch();
+    const viaListener = [];
+    stream.on('change', (c) => viaListener.push(c));
+
+    const firstPull = stream.next(); // parks -- marks the iterator side live
+    await users.insertOne({ i: 1 });
+    await users.insertOne({ i: 2 }); // lands while no next() is parked -- must buffer, not vanish
+
+    const first = await firstPull;
+    const second = await stream.next();
+    expect(first.value.fullDocument.i).toBe(1);
+    expect(second.value.fullDocument.i).toBe(2);
+    expect(viaListener).toHaveLength(2);
+
+    stream.close();
+    await db.close();
+  });
+
   it('costs nothing when nothing is watching: no extra findOne calls', async () => {
     const db = await openDb();
     const users = await db.collection('users');

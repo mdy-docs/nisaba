@@ -104,7 +104,14 @@ function requireModule() {
 
 function codeError(code, context) {
   const msg = ERR[code] || `binjson error ${code}`;
-  return new Error(context ? `${msg} (${context})` : msg);
+  const error = new Error(context ? `${msg} (${context})` : msg);
+  if (bjioLastError) {
+    // A bridged handle swallowed a real exception (bridgeHandle) and the
+    // operation then failed: that exception is the actual story.
+    error.cause = bjioLastError;
+    bjioLastError = null;
+  }
+  return error;
 }
 
 function check(code) {
@@ -402,10 +409,52 @@ const decoder = textDecoder;
  */
 let nextBjioFd = 1;
 
+/** The most recent error a bridged handle call swallowed (see
+ * bridgeHandle); codeError attaches it to the next error it builds as
+ * `cause`, so a QuotaExceededError surfaces on the operation's own error
+ * instead of vanishing behind a generic short-write code. */
+let bjioLastError = null;
+
+/**
+ * Wrap a sync access handle for the EM_JS bridge (Module.bjioHandles): a
+ * JS exception thrown by the handle -- QuotaExceededError mid-write is
+ * the realistic one -- must never propagate up through the WASM frames.
+ * If it did, C would be abandoned mid-mutation with no chance to run its
+ * own error paths (mut_end's in-process rollback in db.c), leaving a
+ * phantom document in the live trees that the next successful write
+ * would then commit durably (docs/roadmap.md P1 #9 -- observed exactly
+ * so before this wrapper existed). Instead every failure is reported
+ * through the bridge's existing error contract -- a short read/write,
+ * which hostio.c already turns into an error return -- so C unwinds
+ * cleanly, rolls the mutation back in-process, and the JS caller gets a
+ * normal coded error with the real exception attached as `cause`.
+ *
+ * getSize is deliberately NOT wrapped: it can't hit quota, and inventing
+ * a size of 0 for a file that failed to answer could make recovery
+ * rewind against fictional lengths -- a thrown getSize means something
+ * catastrophic where an exception is the right outcome.
+ */
+function bridgeHandle(h) {
+  return {
+    getSize: () => h.getSize(),
+    read(buf, opts) {
+      try { return h.read(buf, opts); } catch (err) { bjioLastError = err; return 0; }
+    },
+    write(buf, opts) {
+      try { return h.write(buf, opts); } catch (err) { bjioLastError = err; return 0; }
+    },
+    truncate(len) {
+      // hostio.c's truncate contract is void/best-effort (mut_end's
+      // rewind is itself best-effort); record and continue.
+      try { h.truncate(len); } catch (err) { bjioLastError = err; }
+    }
+  };
+}
+
 function registerHandle(M, syncHandle) {
   if (!M.bjioHandles) M.bjioHandles = {};
   const fd = nextBjioFd++;
-  M.bjioHandles[fd] = syncHandle;
+  M.bjioHandles[fd] = bridgeHandle(syncHandle);
   return fd;
 }
 
@@ -1911,6 +1960,18 @@ const DB_CATALOG_FILE = '__catalog__.bj';
 const DB_DEFAULT_ORDER = 32;
 
 /**
+ * On-disk format version (docs/format-compatibility.md). Stamped into the
+ * catalog under DB_FORMAT_KEY on every open; Db.open() refuses a database
+ * stamped with a NEWER version than this reader understands, loudly and
+ * before touching anything (in particular before the orphan sweep, which
+ * must never judge a future format's files by this version's naming
+ * rules). Bump it only with a written migration story: an older stamp
+ * must either open unchanged (pure additions) or be migrated explicitly.
+ */
+const DB_FORMAT_VERSION = 1;
+const DB_FORMAT_KEY = '__format__'; // reserved catalog key -- not a collection
+
+/**
  * Duck-types rather than strict `instanceof ObjectId`: a caller that built
  * its own value against a *different* copy of binjson's ObjectId (same
  * class, different module instance -- e.g. a thin client package that only
@@ -1929,6 +1990,9 @@ function toObjectId(id) {
 function checkCollectionName(name) {
   if (typeof name !== 'string' || name.length === 0 || name.includes('/') || name.includes('\0')) {
     throw new Error(`Invalid collection name: ${JSON.stringify(name)}`);
+  }
+  if (name === DB_FORMAT_KEY) {
+    throw new Error(`Invalid collection name: "${DB_FORMAT_KEY}" is reserved for the format stamp (docs/format-compatibility.md)`);
   }
 }
 
@@ -2131,27 +2195,67 @@ function resolveCurrentDate(update) {
   return result;
 }
 
+/** Default bound on unconsumed change events buffered for a stream's
+ * async iterator (ChangeStream below; override per stream with watch()'s
+ * `maxBuffered` option). Generous for any real consumer -- an iterator
+ * only falls this far behind when it has effectively stopped. */
+const CHANGE_STREAM_MAX_BUFFERED = 4096;
+
 /**
  * A live feed of change events from a Collection (Collection.watch()) or a
  * SharedCollection (db-coordinator.js's Coordinator.watch()) -- both an
  * EventEmitter-lite (.on('change', cb)) and an async iterator (for await),
  * matching the real driver's ChangeStream dual API. `unsubscribe` (called
  * once, on close()) removes this stream from whatever registry created it.
+ *
+ * Backpressure (docs/roadmap.md P1 #11): events are buffered only for the
+ * async-iterator side, and only while that side is plausibly consuming --
+ * a stream used purely via .on('change') never buffers (its listeners got
+ * each event synchronously; buffering forever for an iterator nobody runs
+ * was the old unbounded-growth bug). The buffer is bounded: at
+ * `maxBuffered` unconsumed events the stream errors out -- it closes, and
+ * pending/subsequent next() calls reject with ChangeStreamOverflowError --
+ * rather than growing without limit or silently dropping events. There
+ * are no resume tokens (a documented non-goal): an overflowed consumer
+ * re-watches and re-reads current state.
  */
 class ChangeStream {
-  constructor(unsubscribe) {
+  constructor(unsubscribe, { maxBuffered = CHANGE_STREAM_MAX_BUFFERED } = {}) {
     this._listeners = new Set();
     this._queue = [];
-    this._waiting = []; // pending next() resolvers, FIFO
+    this._waiting = []; // pending next() {resolve, reject} entries, FIFO
     this._closed = false;
+    this._error = null;      // set on overflow; next() throws it from then on
+    this._iterating = false; // true once next() has ever been called
+    this._maxBuffered = maxBuffered;
     this._unsubscribe = unsubscribe;
   }
 
   _emit(change) {
     if (this._closed) return;
     for (const cb of this._listeners) cb(change);
-    if (this._waiting.length) this._waiting.shift()({ value: change, done: false });
-    else this._queue.push(change);
+    if (this._waiting.length) { this._waiting.shift().resolve({ value: change, done: false }); return; }
+    // Buffer for the iterator unless this stream is listener-only (never
+    // pulled, has listeners): those events were just delivered above, and
+    // queueing them too would grow forever. A mixed consumer (listener +
+    // iterator) buffers normally so the iterator misses nothing between
+    // pulls.
+    if (!this._iterating && this._listeners.size > 0) return;
+    if (this._queue.length >= this._maxBuffered) {
+      // No parked next() to reject here: waiters only ever park on an
+      // empty queue (next() drains it first), so a full queue implies
+      // none. The error surfaces from every next() after this instead.
+      const err = new Error(
+        `ChangeStream overflow: more than ${this._maxBuffered} unconsumed change events -- ` +
+        'consume faster (for await / next()), raise watch()\'s maxBuffered, or close() the stream'
+      );
+      err.name = 'ChangeStreamOverflowError';
+      this._error = err;
+      this._queue = [];
+      this.close();
+      return;
+    }
+    this._queue.push(change);
   }
 
   on(event, cb) {
@@ -2166,9 +2270,11 @@ class ChangeStream {
   }
 
   async next() {
+    this._iterating = true;
+    if (this._error) throw this._error;
     if (this._queue.length) return { value: this._queue.shift(), done: false };
     if (this._closed) return { value: undefined, done: true };
-    return new Promise((resolve) => this._waiting.push(resolve));
+    return new Promise((resolve, reject) => this._waiting.push({ resolve, reject }));
   }
 
   [Symbol.asyncIterator]() { return this; }
@@ -2183,9 +2289,50 @@ class ChangeStream {
     this._closed = true;
     const waiting = this._waiting;
     this._waiting = [];
-    for (const resolve of waiting) resolve({ value: undefined, done: true });
+    for (const w of waiting) w.resolve({ value: undefined, done: true });
     if (this._unsubscribe) this._unsubscribe();
   }
+}
+
+/**
+ * Safety net for abandoned streaming cursors (docs/roadmap.md P1 #10): a
+ * find() cursor that was pulled from but never exhausted or close()d
+ * holds a live WASM-side dc_cursor, which pins WASM memory and blocks
+ * compact() (its scan is physically positioned inside the current files).
+ * Well-behaved callers close or exhaust their cursors -- that stays the
+ * documented contract, because GC gives no timing guarantee -- but when a
+ * cursor object becomes unreachable anyway, this registry frees its
+ * dc_cursor and removes its token from the collection's _openCursors so a
+ * later compact() can proceed.
+ *
+ * The registration is deliberately structured so the entry never keeps
+ * the cursor alive: _openCursors holds a plain { ptr, close() } token
+ * (data only -- its close() references module globals, not find()'s
+ * scope, since any closure over that scope would reach the cursor object
+ * through the shared environment record), and the held value references
+ * the token and the Set, never the cursor.
+ */
+const cursorFinalizer = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(({ token, cursors }) => {
+      if (cursors.delete(token)) token.close();
+    })
+  : null;
+
+/** Mint an _openCursors token. Module-level on purpose: a function
+ * defined lexically inside find() -- even one referencing no variables
+ * from it -- chains its [[Environment]] to find()'s context, which holds
+ * the cursor object, and that one edge would keep every abandoned cursor
+ * alive and the registry above permanently silent. */
+function makeCursorToken(ptr) {
+  return {
+    ptr,
+    close() {
+      if (this.ptr) {
+        requireModule()._dcw_cursor_close(this.ptr);
+        this.ptr = 0;
+      }
+    }
+  };
 }
 
 class Collection {
@@ -2206,29 +2353,50 @@ class Collection {
     this._journalFd = -1;
     this._watchers = new Set(); // open ChangeStreams (see watch())
     this._openCursors = new Set(); // open find() cursors holding a live WASM-side dc_cursor (see find())
-    // The in-flight compact(), as null or a promise that settles when it
-    // finishes. Every public operation opens with
-    //     while (this._compacting) await this._compacting;
-    // queueing behind the compact rather than interleaving with it (a
-    // mutation during the build phase would leave the new generation
-    // internally inconsistent -- its files are streamed one at a time from
-    // the live trees -- and a read during the adopt window would touch
-    // freed WASM handles). Queueing rather than failing loud so a compact
-    // triggered elsewhere (another tab via connectShared, the autoCompact
-    // sweep) is a brief wait for concurrent callers, never a spurious
-    // error. Two rules keep it sound, both relying on async functions
-    // running synchronously until their first await:
-    //   - The loop is inlined at every site, not wrapped in a shared async
-    //     helper: resuming from the await must fall straight through into
-    //     the operation's own synchronous body. A helper's extra microtask
-    //     hop would let a compact() queued on the same promise set the
-    //     flag between the check and the body.
-    //   - It's a loop, not an `if`: a queued compact() may start (and set
-    //     the flag again) the moment the previous one settles.
-    // When the flag is null the loop never awaits, so an operation issued
-    // before a same-tick compact() still runs its synchronous body first,
-    // exactly as a synchronous check would have allowed.
+    // Compaction critical section: compact() must never overlap any other
+    // operation on this collection (a mutation during the build phase
+    // would leave the new generation internally inconsistent -- its files
+    // are streamed one at a time from the live trees -- and a read during
+    // the adopt window would touch freed WASM handles; _indexes is also
+    // transiently empty during the reopen). Two pieces enforce it:
+    //
+    //   - `_compacting`: null, or a promise settling when the in-flight
+    //     compact() finishes. Every public operation waits it out before
+    //     starting (see the prototype wrapper after this class) --
+    //     queueing rather than failing loud, so a compact triggered
+    //     elsewhere (another tab via connectShared, the autoCompact sweep)
+    //     is a brief wait for concurrent callers, never a spurious error.
+    //   - `_inFlight`: the count of operations currently past that gate.
+    //     compact() waits for it to drain to zero before setting
+    //     `_compacting` and touching any file, so an operation that
+    //     awaits internally mid-body (e.g. a mutation resolving its watch
+    //     documentKey via findOne) can never have a compact start inside
+    //     that window.
+    //
+    // The invariant that makes re-entrancy safe: `_compacting` is only
+    // ever set at a drained instant (gate-set and the `_inFlight === 0`
+    // check happen in one synchronous region). So while any counted
+    // operation runs, the gate is provably open, and its internal calls
+    // into other public methods (bulkWrite -> insertOne, pruneExpired ->
+    // deleteMany, watch bookkeeping -> findOne) just nest the count --
+    // they can never deadlock against a compact waiting on their parent.
+    // New operations arriving during compact()'s drain wait also pass the
+    // still-open gate; compact simply waits for the next quiescent
+    // instant (ops here are short -- worst case it's delayed, never
+    // starved forever by a caller that awaits its own operations).
     this._compacting = null;
+    this._inFlight = 0;
+    this._drainWaiters = []; // resolvers parked by compact() until _inFlight drains to 0
+  }
+
+  /** Decrement _inFlight and, on reaching zero, wake compact()s parked in
+   * their drain wait (see the prototype wrapper after this class). */
+  _opDone() {
+    if (--this._inFlight === 0 && this._drainWaiters.length) {
+      const waiters = this._drainWaiters;
+      this._drainWaiters = [];
+      for (const w of waiters) w();
+    }
   }
 
   /**
@@ -2244,7 +2412,7 @@ class Collection {
     if (pipeline.length) {
       throw new Error('Collection.watch: pipeline stages are not supported yet');
     }
-    const stream = new ChangeStream(() => this._watchers.delete(stream));
+    const stream = new ChangeStream(() => this._watchers.delete(stream), { maxBuffered: options.maxBuffered });
     this._watchers.add(stream);
     return stream;
   }
@@ -2361,9 +2529,16 @@ class Collection {
   }
 
   async _close() {
-    while (this._compacting) await this._compacting;
     for (const stream of [...this._watchers]) stream.close();
-    for (const fcursor of [...this._openCursors]) await fcursor.close();
+    // _openCursors holds { ptr, close() } tokens, not the cursor objects
+    // (see cursorFinalizer above the class). Closing the token frees the
+    // WASM-side dc_cursor; the cursor object, if still referenced, sees
+    // ptr === 0 on its next pull and reports itself exhausted.
+    for (const token of [...this._openCursors]) {
+      if (cursorFinalizer) cursorFinalizer.unregister(token);
+      token.close();
+    }
+    this._openCursors.clear();
     await this._closeHandles();
   }
 
@@ -2438,7 +2613,6 @@ class Collection {
    * Returns the index name (options.name, or a MongoDB-shaped default).
    */
   async createIndex(keys, options = {}) {
-    while (this._compacting) await this._compacting;
     const keyFields = Object.keys(keys);
     const isSpecial = keyFields.length === 1 && (keys[keyFields[0]] === 'text' || keys[keyFields[0]] === '2dsphere');
     if (isSpecial && (options.unique || options.sparse || options.partialFilterExpression || options.expireAfterSeconds !== undefined)) {
@@ -2558,7 +2732,6 @@ class Collection {
   }
 
   async dropIndex(name) {
-    while (this._compacting) await this._compacting;
     const entry = this._indexes.get(name);
     if (!entry) throw new Error(`Index not found: ${name}`);
     const M = requireModule();
@@ -2586,7 +2759,6 @@ class Collection {
   }
 
   async listIndexes() {
-    while (this._compacting) await this._compacting; // _indexes is transiently empty during compact()'s reopen
     return [...this._indexes.entries()].map(([name, ix]) => {
       if (ix.kind === 'equality') {
         const def = { name, key: Object.fromEntries(ix.fields.map(f => [f, 1])) };
@@ -2608,7 +2780,6 @@ class Collection {
    * filter operator instead (db.c dispatches to the right index).
    */
   async findByIndex(name, values) {
-    while (this._compacting) await this._compacting;
     const entry = this._indexes.get(name);
     if (!entry) throw new Error(`Index not found: ${name}`);
     if (entry.kind !== 'equality') throw new Error(`findByIndex requires an equality index (got kind: ${entry.kind})`);
@@ -2627,7 +2798,6 @@ class Collection {
   }
 
   async insertOne(doc) {
-    while (this._compacting) await this._compacting;
     if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
       throw new Error('insertOne requires a document object');
     }
@@ -2649,7 +2819,6 @@ class Collection {
    * needs to report success/failure per index (see dc_insert_many).
    */
   async insertMany(docs, { ordered = true } = {}) {
-    while (this._compacting) await this._compacting;
     if (!Array.isArray(docs) || docs.length === 0) {
       throw new Error('insertMany requires a non-empty array of documents');
     }
@@ -2682,7 +2851,6 @@ class Collection {
 
   /** `options.projection` follows the same inclusion-XOR-exclusion rules as find()'s (`_id` defaults included). */
   async findOne(filter = {}, options = {}) {
-    while (this._compacting) await this._compacting;
     const M = requireModule();
     const fbytes = encode(filter);
     const projBytes = options.projection ? encode(options.projection) : new Uint8Array(0);
@@ -2741,37 +2909,47 @@ class Collection {
 
     async function eagerToArray() {
       while (collection._compacting) await collection._compacting;
-      const M = requireModule();
-      const fBytes = encode(filter);
-      const sortBytes = state.sort ? encode(state.sort) : new Uint8Array(0);
-      const projBytes = state.projection ? encode(state.projection) : new Uint8Array(0);
-
-      const fp = fBytes.length ? M._malloc(fBytes.length) : 0;
-      const sp = sortBytes.length ? M._malloc(sortBytes.length) : 0;
-      const pp = projBytes.length ? M._malloc(projBytes.length) : 0;
-      if (fBytes.length) M.HEAPU8.set(fBytes, fp);
-      if (sortBytes.length) M.HEAPU8.set(sortBytes, sp);
-      if (projBytes.length) M.HEAPU8.set(projBytes, pp);
-
-      let rc;
+      collection._inFlight++; // same gate + count as the prototype wrapper -- see the constructor
       try {
-        rc = M._dcw_find(
-          collection._outCtx, collection._collCtx,
-          fp, fBytes.length,
-          sp, sortBytes.length,
-          state.skip, state.limit,
-          pp, projBytes.length
-        );
+        const M = requireModule();
+        const fBytes = encode(filter);
+        const sortBytes = state.sort ? encode(state.sort) : new Uint8Array(0);
+        const projBytes = state.projection ? encode(state.projection) : new Uint8Array(0);
+
+        const fp = fBytes.length ? M._malloc(fBytes.length) : 0;
+        const sp = sortBytes.length ? M._malloc(sortBytes.length) : 0;
+        const pp = projBytes.length ? M._malloc(projBytes.length) : 0;
+        if (fBytes.length) M.HEAPU8.set(fBytes, fp);
+        if (sortBytes.length) M.HEAPU8.set(sortBytes, sp);
+        if (projBytes.length) M.HEAPU8.set(projBytes, pp);
+
+        let rc;
+        try {
+          rc = M._dcw_find(
+            collection._outCtx, collection._collCtx,
+            fp, fBytes.length,
+            sp, sortBytes.length,
+            state.skip, state.limit,
+            pp, projBytes.length
+          );
+        } finally {
+          if (fp) M._free(fp);
+          if (sp) M._free(sp);
+          if (pp) M._free(pp);
+        }
+        if (rc !== 0) throw codeError(rc, 'find');
+        return collection._readOut(M) ?? [];
       } finally {
-        if (fp) M._free(fp);
-        if (sp) M._free(sp);
-        if (pp) M._free(pp);
+        collection._opDone();
       }
-      if (rc !== 0) throw codeError(rc, 'find');
-      return collection._readOut(M) ?? [];
     }
 
-    let wasmCursor = 0; // dc_cursor*, once opened
+    // The live WASM-side dc_cursor, held via a plain { ptr, close() }
+    // token (makeCursorToken) in collection._openCursors rather than the
+    // cursor object itself, so an abandoned cursor stays collectable and
+    // cursorFinalizer can reclaim it (see both doc comments above class
+    // Collection).
+    let cursorToken = null;
     let exhausted = false;
     let pending = []; // docs fetched but not yet handed out
     let pendingIdx = 0;
@@ -2800,34 +2978,49 @@ class Collection {
         if (pp) M._free(pp);
         M._free(errP);
       }
-      wasmCursor = ptr;
-      collection._openCursors.add(fcursor);
+      cursorToken = makeCursorToken(ptr); // module-level factory -- see its doc comment
+      collection._openCursors.add(cursorToken);
+      if (cursorFinalizer) {
+        cursorFinalizer.register(fcursor, { token: cursorToken, cursors: collection._openCursors }, cursorToken);
+      }
     }
 
     function closeWasmCursor() {
-      if (wasmCursor) {
-        requireModule()._dcw_cursor_close(wasmCursor);
-        wasmCursor = 0;
-        collection._openCursors.delete(fcursor);
+      if (cursorToken) {
+        if (cursorFinalizer) cursorFinalizer.unregister(cursorToken);
+        collection._openCursors.delete(cursorToken);
+        cursorToken.close();
+        cursorToken = null;
       }
     }
 
     async function fetchBatch(maxCount) {
       while (collection._compacting) await collection._compacting;
-      const M = requireModule();
-      if (!wasmCursor) openWasmCursor();
-      const doneP = M._malloc(4);
-      let rc, done;
+      collection._inFlight++; // same gate + count as the prototype wrapper -- see the constructor
       try {
-        rc = M._dcw_cursor_next_batch(collection._outCtx, wasmCursor, maxCount, doneP);
-        if (rc !== 0) throw codeError(rc, 'find');
-        done = !!readU32(M, doneP);
+        const M = requireModule();
+        if (cursorToken && !cursorToken.ptr) {
+          // Closed underneath us (Collection._close during shutdown).
+          exhausted = true;
+          cursorToken = null;
+          return [];
+        }
+        if (!cursorToken) openWasmCursor();
+        const doneP = M._malloc(4);
+        let rc, done;
+        try {
+          rc = M._dcw_cursor_next_batch(collection._outCtx, cursorToken.ptr, maxCount, doneP);
+          if (rc !== 0) throw codeError(rc, 'find');
+          done = !!readU32(M, doneP);
+        } finally {
+          M._free(doneP);
+        }
+        const batch = collection._readOut(M) ?? [];
+        if (done) { exhausted = true; closeWasmCursor(); }
+        return batch;
       } finally {
-        M._free(doneP);
+        collection._opDone();
       }
-      const batch = collection._readOut(M) ?? [];
-      if (done) { exhausted = true; closeWasmCursor(); }
-      return batch;
     }
 
     const fcursor = {
@@ -2881,7 +3074,6 @@ class Collection {
   }
 
   async deleteOne(filter = {}) {
-    while (this._compacting) await this._compacting;
     const M = requireModule();
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
@@ -2894,7 +3086,6 @@ class Collection {
 
   /** Delete every document matching `filter`. */
   async deleteMany(filter = {}) {
-    while (this._compacting) await this._compacting;
     const M = requireModule();
     const watching = this._watchers.size > 0;
     const preIds = watching ? (await this.find(filter, { projection: { _id: 1 } }).toArray()).map(d => d._id) : null;
@@ -2910,7 +3101,6 @@ class Collection {
   /** Atomically find the first document matching `filter` and delete it,
    * returning the deleted document (or null if nothing matched). */
   async findOneAndDelete(filter = {}) {
-    while (this._compacting) await this._compacting;
     const M = requireModule();
     const fbytes = encode(filter);
     const found = withBytes(M, fbytes, (p, n) => M._dcw_find_one_and_delete(this._outCtx, this._collCtx, p, n));
@@ -2976,7 +3166,6 @@ class Collection {
   }
 
   async replaceOne(filter, replacement, { upsert = false } = {}) {
-    while (this._compacting) await this._compacting;
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('replaceOne requires a replacement document object');
     }
@@ -3008,7 +3197,6 @@ class Collection {
    * to return, matching real MongoDB).
    */
   async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
-    while (this._compacting) await this._compacting;
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('findOneAndReplace requires a replacement document object');
     }
@@ -3036,7 +3224,6 @@ class Collection {
    * use replaceOne instead.
    */
   async updateOne(filter, update, { upsert = false } = {}) {
-    while (this._compacting) await this._compacting;
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateOne requires an update document object');
     }
@@ -3067,7 +3254,6 @@ class Collection {
    * findOneAndReplace's exact convention for "nothing to return".
    */
   async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
-    while (this._compacting) await this._compacting;
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('findOneAndUpdate requires an update document object');
     }
@@ -3093,7 +3279,6 @@ class Collection {
    * matching) — modifiedCount always mirrors matchedCount.
    */
   async updateMany(filter, update, { upsert = false } = {}) {
-    while (this._compacting) await this._compacting;
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateMany requires an update document object');
     }
@@ -3126,7 +3311,6 @@ class Collection {
   }
 
   async countDocuments(filter = {}) {
-    while (this._compacting) await this._compacting;
     const M = requireModule();
     const fbytes = encode(filter);
     const n = withBytes(M, fbytes, (p, len) => M._dcw_count(this._collCtx, p, len));
@@ -3144,7 +3328,6 @@ class Collection {
   /** Unique values of `field` (dot-separated path) across every document
    * matching `filter`. */
   async distinct(field, filter = {}) {
-    while (this._compacting) await this._compacting;
     const M = requireModule();
     const f = allocStr(M, field);
     const fbytes = encode(filter);
@@ -3173,7 +3356,6 @@ class Collection {
    * error afterward if any failed.
    */
   async bulkWrite(operations, { ordered = true } = {}) {
-    while (this._compacting) await this._compacting;
     if (!Array.isArray(operations) || operations.length === 0) {
       throw new Error('bulkWrite requires a non-empty array of operations');
     }
@@ -3245,7 +3427,6 @@ class Collection {
    * removed across all TTL indexes.
    */
   async pruneExpired() {
-    while (this._compacting) await this._compacting;
     let deletedCount = 0;
     for (const ix of this._indexes.values()) {
       if (ix.kind !== 'equality' || ix.expireAfterSeconds === undefined) continue;
@@ -3295,7 +3476,17 @@ class Collection {
    * Returns { generation, bytesBefore, bytesAfter, bytesFreed }.
    */
   async compact() {
-    while (this._compacting) await this._compacting; // back-to-back compacts serialize like any other op
+    // Wait until BOTH hold in one synchronous region: no other compact in
+    // flight (back-to-back compacts serialize) and no counted operation
+    // in flight (see _inFlight's doc in the constructor). Each is
+    // re-checked after every wait -- resuming from either await, another
+    // compact may have taken the gate or another operation may have
+    // entered the still-open gate, in any order.
+    for (;;) {
+      if (this._compacting) { await this._compacting; continue; }
+      if (this._inFlight > 0) { await new Promise((resolve) => this._drainWaiters.push(resolve)); continue; }
+      break;
+    }
     if (this._openCursors.size > 0) {
       throw new Error(`compact: collection "${this.name}" has open find() cursors -- close or exhaust them first`);
     }
@@ -3397,6 +3588,37 @@ class Collection {
   }
 }
 
+// Compaction critical section, applied in one place rather than pasted
+// into every method (see _compacting/_inFlight's doc in the constructor):
+// wait out an in-flight compact(), then run counted so a compact that
+// starts meanwhile waits for the drain before touching files. The gate
+// check, the increment, and the original method's synchronous body all
+// run in one synchronous region (async functions run synchronously until
+// their first await, and `orig` is invoked directly from this wrapper's
+// own frame), so a compact can never take the gate between the check and
+// the body. Not wrapped: compact() (it owns the gate), find() (returns
+// its cursor synchronously; the cursor's eagerToArray/fetchBatch carry
+// the same gate + count inline), and watch() (touches no files).
+for (const name of [
+  '_close', 'createIndex', 'dropIndex', 'listIndexes', 'findByIndex',
+  'insertOne', 'insertMany', 'findOne',
+  'deleteOne', 'deleteMany', 'findOneAndDelete',
+  'replaceOne', 'findOneAndReplace',
+  'updateOne', 'findOneAndUpdate', 'updateMany',
+  'countDocuments', 'distinct', 'bulkWrite', 'pruneExpired'
+]) {
+  const orig = Collection.prototype[name];
+  Collection.prototype[name] = async function (...args) {
+    while (this._compacting) await this._compacting;
+    this._inFlight++;
+    try {
+      return await orig.apply(this, args);
+    } finally {
+      this._opDone();
+    }
+  };
+}
+
 class Db {
   constructor(provider, { order = DB_DEFAULT_ORDER, autoCompact = null } = {}) {
     this._provider = provider;
@@ -3425,6 +3647,23 @@ class Db {
     const handle = await this._provider.openFile(DB_CATALOG_FILE, { create: true });
     this._catalog = new BPlusTree(handle, this._order);
     await this._catalog.open();
+    // Format gate before anything else touches the files (see
+    // DB_FORMAT_VERSION's doc and docs/format-compatibility.md). A
+    // database without a stamp predates the stamp and is by definition
+    // version 1; it gets stamped now, as does a fresh one.
+    const stamp = this._catalog.search(DB_FORMAT_KEY);
+    if (stamp && stamp.v > DB_FORMAT_VERSION) {
+      await this._catalog.close();
+      this._catalog = null;
+      throw new Error(
+        `Database format is version ${stamp.v}, but this build of nisaba only understands up to ` +
+        `version ${DB_FORMAT_VERSION} -- upgrade nisaba to open it (docs/format-compatibility.md)`
+      );
+    }
+    if (!stamp || stamp.v < DB_FORMAT_VERSION) {
+      this._catalog.add(DB_FORMAT_KEY, { v: DB_FORMAT_VERSION });
+      this._catalog.flush();
+    }
     await this._sweepOrphans();
     this.isOpen = true;
     if (this._autoCompact) {
@@ -3456,6 +3695,7 @@ class Db {
     if (typeof this._provider.listFiles !== 'function') return;
     const referenced = new Set([DB_CATALOG_FILE]);
     for (const { key: name, value: entry } of this._catalog.toArray()) {
+      if (name === DB_FORMAT_KEY) continue; // the format stamp owns no files
       referenced.add(entry.file);
       referenced.add(entry.journal || journalFileName(name));
       for (const def of entry.indexes || []) {
@@ -3515,10 +3755,11 @@ class Db {
   }
 
   async listCollections() {
-    return this._catalog.toArray().map(({ key }) => key);
+    return this._catalog.toArray().map(({ key }) => key).filter((k) => k !== DB_FORMAT_KEY);
   }
 
   async dropCollection(name) {
+    checkCollectionName(name); // also shields the reserved format stamp
     const entry = this._catalog.search(name);
     if (!entry) return false;
     const cached = this._collections.get(name);
@@ -3554,6 +3795,21 @@ class Db {
    * autoCompact option, a host timer) wants: a busy collection gets its
    * turn on the next sweep. Returns { [collectionName]: stats | null }.
    */
+  /**
+   * navigator.storage.estimate() where the platform provides it -- the
+   * cheap early-warning knob for OPFS quota pressure: check it on a
+   * timer or around large writes and warn users before mutations start
+   * failing (a quota failure surfaces as a coded error whose `cause` is
+   * the handle's QuotaExceededError; the write itself is rolled back --
+   * see bridgeHandle). Origin-wide, not per-database. Returns
+   * { usage, quota, ... } or null where unavailable (plain Node, no
+   * OPFS shim).
+   */
+  async storageEstimate() {
+    if (typeof navigator === 'undefined' || !navigator.storage || typeof navigator.storage.estimate !== 'function') return null;
+    return navigator.storage.estimate();
+  }
+
   async compact({ minBytes = 0, factor = 0, skipBusy = false } = {}) {
     const results = {};
     for (const name of await this.listCollections()) {

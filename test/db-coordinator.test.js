@@ -17,7 +17,7 @@
  * installed).
  */
 import { describe, it, expect } from 'vitest';
-import { ready, MemoryStorageProvider, ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready, MemoryStorageProvider, ObjectId, encode } from '../wasm/nisaba-wasm.js';
 import { connect } from '../src/db.js';
 import { connectShared } from '../src/db-coordinator.js';
 
@@ -119,6 +119,50 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
     expect(names).toEqual(['Grace', 'Katherine']);
 
     await Promise.all(survivors.map((d) => d.close()));
+  });
+
+  it('a retried request (same requestId) is replayed by the leader, never executed twice', async () => {
+    const provider = new MemoryStorageProvider();
+    const dbName = nextDbName();
+    const [a, b] = await Promise.all([
+      connectShared(dbName, provider, {}),
+      connectShared(dbName, provider, {})
+    ]);
+    const leader = a._coord.role === 'leader' ? a : b;
+    const follower = leader === a ? b : a;
+
+    // Drive the leader's real wire path directly: the exact duplicate a
+    // follower's timeout-retry produces (same requestId, same payload --
+    // see _rpcCall). The second must be answered from _rpcReplies, not
+    // re-executed.
+    const requestId = 'dedup-test-1';
+    const payload = encode(['users', 'insertOne', [{ name: 'exactly-once' }]]);
+    follower._coord.channel.postMessage({ type: 'request', requestId, payload });
+    follower._coord.channel.postMessage({ type: 'request', requestId, payload });
+
+    // Both replies arrive asynchronously; wait for the write to be visible,
+    // then a beat longer to catch a hypothetical double-execution.
+    const users = await follower.collection('users');
+    let docs = [];
+    for (let attempt = 0; attempt < 50 && docs.length === 0; attempt++) {
+      docs = await users.find({ name: 'exactly-once' }).toArray();
+      if (docs.length === 0) await new Promise((r) => setTimeout(r, 100));
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    docs = await users.find({ name: 'exactly-once' }).toArray();
+    expect(docs).toHaveLength(1);
+
+    // Error replies are replayed identically too (still exactly one
+    // execution attempt behind both).
+    const badId = 'dedup-test-2';
+    const badPayload = encode(['users', 'insertOne', [{ _id: docs[0]._id, name: 'dup' }]]);
+    follower._coord.channel.postMessage({ type: 'request', requestId: badId, payload: badPayload });
+    follower._coord.channel.postMessage({ type: 'request', requestId: badId, payload: badPayload });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(await users.countDocuments({})).toBe(1);
+    expect(leader._coord._rpcReplies.has(badId)).toBe(true); // cached for replay
+
+    await Promise.all([a, b].map((d) => d.close()));
   });
 
   it('autoCompact options reach the initial leader and every later-elected leader', async () => {
