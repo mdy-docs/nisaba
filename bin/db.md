@@ -16,11 +16,17 @@ defaults to `collections`.
 
 ## Where files go
 
-This tool runs under Node via [`node-opfs`](https://www.npmjs.com/package/node-opfs),
-which backs OPFS with real files under `~/.node-opfs` by default (same as
-`bplustree`/`rtree`/`textindex`/`textlog`). A database named `mydb` lives at
-`~/.node-opfs/mydb/` — one `__catalog__.bj` file plus one file per collection
-and per index.
+This tool persists through `NodeFSStorageProvider` (`nisaba/node`) — plain
+`node:fs`, no OPFS shim. The data root is `$NISABA_DIR`, defaulting to
+`~/.nisaba`; a database named `mydb` lives at `~/.nisaba/mydb/` — one
+`__catalog__.bj` file plus one file per collection and per index, and a
+`.nisaba-lock` advisory lock while a process holds the directory open
+(one opener per database directory; a lock left by a dead process is
+reclaimed automatically).
+
+Databases created by earlier versions of this tool (which ran through the
+`node-opfs` shim under `~/.node-opfs`) still open fine — the bytes are the
+same format. Point `NISABA_DIR=~/.node-opfs` to keep using them.
 
 ## Commands
 
@@ -167,11 +173,11 @@ db mydb count users
 
 ## Running
 
-Requires [`node-opfs`](https://www.npmjs.com/package/node-opfs) (installed
-as a dev dependency). Run it directly:
+No extra dependencies — run it directly:
 
 ```sh
 node bin/db.js mydb collections
+NISABA_DIR=/somewhere/else node bin/db.js mydb collections
 ```
 
 or, once the package is installed, via the `db` bin.

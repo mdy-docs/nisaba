@@ -25,11 +25,23 @@ the entry-point split (`nisaba` full / `nisaba/remote` ~11 KB main-thread
 
 ## P0 — adoption blockers
 
+**Status: all six items landed 2026-07-16.** Notes against the original
+acceptance criteria: #3 resolved as the documented-restriction branch —
+the spike confirmed the C core is OID-typed end to end (fixed 12-byte
+primary keys, OID back-pointers in every index row, `{_id}` fast paths),
+so scalar `_id`s are a format-v2 migration, now recorded below; scalar
+`_id`s throw `InvalidIdError` pointing at the unique-index alternative.
+#4 shipped with its own dedicated suite (`test/db.nodefs.test.js`)
+rather than parametrizing the OPFS tests — parametrization is still
+worth doing. #5's wasm job verifies by rebuilding and running the suite
+against fresh artifacts instead of byte-diffing (emcc output isn't
+reproducible enough across hosts for a byte gate).
+
 Everything an evaluator hits in the first ten minutes, plus the two
 things that make Node a real target. Do these before publicizing
 anything.
 
-### 1. TypeScript declarations
+### 1. TypeScript declarations ✅
 
 No `.d.ts`, no `types` field in package.json. For a MongoDB-shaped API
 this is the single highest-leverage fix — the shapes are well-known and
@@ -45,7 +57,7 @@ the whole public surface is already enumerated in `docs/db-api.md`.
   for every documented API; `tsc --noEmit` passes on `docs/db-example.js`
   converted to TS as a fixture.
 
-### 2. Named, coded errors
+### 2. Named, coded errors ✅
 
 `codeError()` (`wasm/nisaba-wasm.js`) produces bare `Error`s: `e.code`
 is `undefined`, `e.name` is `"Error"`. Programmatic handling requires
@@ -62,7 +74,7 @@ everything needed.
   carry `code`/`name` through the payload so followers rebuild the same
   shape (`db-coordinator.js` already rebuilds `result`/`writeErrors`).
 
-### 3. Scalar `_id` support (or a loud, documented restriction)
+### 3. Scalar `_id` support (or a loud, documented restriction) ✅ (restriction branch)
 
 Verified empirically: `{ _id: 'user-42' }` and `{ _id: 1 }` both throw
 (`toObjectId` requires ObjectId/24-hex). MongoDB accepts any scalar
@@ -82,7 +94,7 @@ Verified empirically: `{ _id: 'user-42' }` and `{ _id: 1 }` both throw
   update/delete/watch/index paths with tests, or the restriction is
   impossible to miss.
 
-### 4. `NodeFSStorageProvider` — make Node first-class
+### 4. `NodeFSStorageProvider` — make Node first-class ✅
 
 Persistence in Node currently rides on `node-opfs`, a third-party OPFS
 shim that isn't even a dependency (`bin/db.js` exits with "install
@@ -108,7 +120,7 @@ don't choose.
   with a clear error; `kill -9` mid-write recovers on reopen (the
   journal tests, but against real files).
 
-### 5. CI
+### 5. CI ✅
 
 220 node tests plus a browser suite exist, and nothing runs them on
 commit — the browser suite isn't even installable here
@@ -123,7 +135,7 @@ else on this list is trustworthy without this.
 - Acceptance: red PRs on any suite failure; the browser suite runs
   somewhere at last.
 
-### 6. README/doc import hygiene (30 minutes)
+### 6. README/doc import hygiene ✅
 
 README's usage block imports `./wasm/nisaba-wasm.js`; docs mix relative
 paths. Teach the curated entries: `nisaba`, `nisaba/remote`,
@@ -219,6 +231,11 @@ deliberate error, and a test opening a doctored future-version file.
 - **Benchmarks** — a small tracked suite (insert/query/index/compact at
   1k/100k docs, node + browser) guarding the WASM-boundary cost from
   regressions.
+- **Scalar `_id` support (format v2)** — the P0 #3 spike's finding:
+  variable-length primary keys via `db_keyenc`'s ordered encoding, new
+  index-row back-pointer format, migration per
+  `docs/format-compatibility.md`'s rules. A real project; the format
+  stamp machinery it needs now exists.
 - **Non-goals to state in the README**: cross-collection transactions,
   watch() pipelines/`updateDescription` beyond current scope,
   multi-writer across origins/processes (single-leader by design).

@@ -5,7 +5,9 @@
 # flags, same combined-binary shape) but links only this package's own
 # sources plus its nested binjson/binjson-structures/regex-engine
 # submodules -- nothing here depends on the parent repo. Requires `emcc`
-# on PATH (emsdk) and the submodules checked out
+# on PATH (emsdk; the committed wasm/lib artifacts were built with 5.0.7,
+# which CI pins -- keep .github/workflows/ci.yml in lockstep when
+# upgrading) and the submodules checked out
 # (`git submodule update --init`).
 set -euo pipefail
 

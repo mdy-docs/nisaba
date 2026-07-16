@@ -187,6 +187,8 @@ class Coordinator {
           // exactly like a local caller would.
           const info = decode(msg.payload);
           const err = new Error(info.message);
+          if (info.name) err.name = info.name;         // coded-error identity survives the wire...
+          if (info.code !== undefined && info.code !== null) err.code = info.code; // ...as data, not prototype
           if (info.result !== undefined && info.result !== null) err.result = info.result;
           if (info.writeErrors) err.writeErrors = info.writeErrors.map((w) => ({ index: w.index, error: new Error(w.message) }));
           p.reject(err);
@@ -247,6 +249,11 @@ class Coordinator {
       // writeErrors nest real Error objects, which can't cross the codec --
       // only their index + message survive the trip.
       const info = { message: err.message };
+      // Coded errors (NisabaError subclasses) keep their identity across
+      // the wire as data -- the follower re-attaches name/code to the
+      // rebuilt Error (branch on err.name/err.code there, not instanceof).
+      if (err.name && err.name !== 'Error') info.name = err.name;
+      if (err.code !== undefined) info.code = err.code;
       if (err.result !== undefined) info.result = err.result;
       if (err.writeErrors) info.writeErrors = err.writeErrors.map((w) => ({ index: w.index, message: w.error?.message ?? String(w.error) }));
       return { type: 'error', payload: encode(info) };

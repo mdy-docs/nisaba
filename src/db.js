@@ -20,7 +20,13 @@ export {
   OPFSStorageProvider,
   connect,
   Client,
-  connectClient
+  connectClient,
+  NisabaError,
+  DuplicateKeyError,
+  MissingIndexedFieldError,
+  UnindexableValueError,
+  ChangeStreamOverflowError,
+  InvalidIdError
 } from '../wasm/nisaba-wasm.js';
 
 // Main-thread-safe surface: the pure-JS (no WASM) codec and the Worker RPC

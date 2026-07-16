@@ -102,9 +102,51 @@ function requireModule() {
   return Module;
 }
 
+/**
+ * Base class for every coded error this module raises (docs/roadmap.md
+ * P0 #2): `code` carries the C-side error code (the ERR map above), and
+ * `name` identifies the class -- so callers branch on `err.code` or
+ * `err.name` instead of matching message strings. Errors proxied across
+ * the coordinator's RPC wire keep their `code`/`name` (rebuilt on the
+ * follower -- see db-coordinator.js) but not their prototype: test with
+ * `err.name`, not `instanceof`, when the error may have crossed tabs.
+ */
+class NisabaError extends Error {
+  constructor(message, code = 0) {
+    super(message);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+/** Duplicate _id (-10) or unique-index violation (-12). */
+class DuplicateKeyError extends NisabaError {}
+/** Document lacks a field a non-sparse index requires (-13). */
+class MissingIndexedFieldError extends NisabaError {}
+/** Indexed field value can't be key-encoded (-14). */
+class UnindexableValueError extends NisabaError {}
+/** A ChangeStream's iterator buffer overflowed (see ChangeStream). */
+class ChangeStreamOverflowError extends NisabaError {}
+/** `_id` isn't an ObjectId (see toObjectId). Unlike MongoDB, scalar _ids
+ * (numbers, arbitrary strings, Dates) are not supported: the on-disk
+ * format keys the primary tree and every index back-pointer with fixed
+ * 12-byte OIDs (db.c's dc_get_id/oid_key), so lifting the restriction is
+ * a format-version bump with a migration, not a validation tweak
+ * (docs/roadmap.md P0 #3 records the spike). Keep natural keys in their
+ * own field with a unique index instead. */
+class InvalidIdError extends NisabaError {}
+
+/** code -> class for codeError; anything unlisted raises plain NisabaError. */
+const ERR_CLASS = {
+  [-10]: DuplicateKeyError,
+  [-12]: DuplicateKeyError,
+  [-13]: MissingIndexedFieldError,
+  [-14]: UnindexableValueError
+};
+
 function codeError(code, context) {
   const msg = ERR[code] || `binjson error ${code}`;
-  const error = new Error(context ? `${msg} (${context})` : msg);
+  const cls = ERR_CLASS[code] || NisabaError;
+  const error = new cls(context ? `${msg} (${context})` : msg, code);
   if (bjioLastError) {
     // A bridged handle swallowed a real exception (bridgeHandle) and the
     // operation then failed: that exception is the actual story.
@@ -1982,9 +2024,14 @@ const DB_FORMAT_KEY = '__format__'; // reserved catalog key -- not a collection
  */
 function toObjectId(id) {
   if (id instanceof ObjectId) return id;
-  if (typeof id === 'string') return new ObjectId(id);
+  if (typeof id === 'string' && /^[0-9a-fA-F]{24}$/.test(id)) return new ObjectId(id);
   if (id && typeof id.toHexString === 'function') return new ObjectId(id.toHexString());
-  throw new Error(`Invalid _id: ${id}`);
+  throw new InvalidIdError(
+    `Invalid _id: ${JSON.stringify(id)} -- _id must be an ObjectId (or its 24-hex string). ` +
+    'Unlike MongoDB, scalar _ids (numbers, arbitrary strings, Dates) are not supported by the ' +
+    'on-disk format; keep natural keys in their own field with a unique index: ' +
+    "createIndex({ field: 1 }, { unique: true }). See docs/db-api.md."
+  );
 }
 
 function checkCollectionName(name) {
@@ -2245,12 +2292,10 @@ class ChangeStream {
       // No parked next() to reject here: waiters only ever park on an
       // empty queue (next() drains it first), so a full queue implies
       // none. The error surfaces from every next() after this instead.
-      const err = new Error(
+      this._error = new ChangeStreamOverflowError(
         `ChangeStream overflow: more than ${this._maxBuffered} unconsumed change events -- ` +
         'consume faster (for await / next()), raise watch()\'s maxBuffered, or close() the stream'
       );
-      err.name = 'ChangeStreamOverflowError';
-      this._error = err;
       this._queue = [];
       this.close();
       return;
@@ -3890,6 +3935,12 @@ export {
   ready,
   isReady,
   TYPE,
+  NisabaError,
+  DuplicateKeyError,
+  MissingIndexedFieldError,
+  UnindexableValueError,
+  ChangeStreamOverflowError,
+  InvalidIdError,
   ObjectId,
   Pointer,
   encode,

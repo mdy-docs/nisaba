@@ -1,21 +1,14 @@
 #!/usr/bin/env node
-import { ready, connectClient, OPFSStorageProvider, ObjectId, Pointer } from '../wasm/nisaba-wasm.js';
+import os from 'node:os';
+import path from 'node:path';
+import { ready, connectClient, ObjectId, Pointer } from '../wasm/nisaba-wasm.js';
+import { NodeFSStorageProvider } from '../src/db-node.js';
 
-// Set up node-opfs for Node.js environment
-try {
-  const nodeOpfs = await import('node-opfs');
-  if (nodeOpfs.navigator && typeof global !== 'undefined') {
-    Object.defineProperty(global, 'navigator', {
-      value: nodeOpfs.navigator,
-      writable: true,
-      configurable: true
-    });
-  }
-} catch (e) {
-  console.error('Error: node-opfs is required to run this tool in Node.js');
-  console.error('Install it with: npm install node-opfs');
-  process.exit(1);
-}
+// Data root: $NISABA_DIR, else ~/.nisaba -- one subdirectory per database
+// name (NodeFSStorageProvider.subProvider). Earlier versions of this tool
+// ran through the node-opfs shim and stored under ~/.node-opfs; those
+// files still work -- point NISABA_DIR at the old directory to keep them.
+const DATA_ROOT = process.env.NISABA_DIR || path.join(os.homedir(), '.nisaba');
 
 function usage() {
   console.error(`Usage: db <name> <command> [args] [options]
@@ -229,7 +222,8 @@ async function main() {
 
   await ready();
 
-  const client = await connectClient(new OPFSStorageProvider(), { order: opts.order });
+  const provider = new NodeFSStorageProvider(DATA_ROOT);
+  const client = await connectClient(provider, { order: opts.order });
   const db = await client.db(dbName);
 
   try {
@@ -563,9 +557,11 @@ async function main() {
     }
 
     await client.close();
+    await provider.close(); // release the directory locks (a crash leaves a stale-pid lock, reclaimed on next run)
   } catch (err) {
     console.error(`Error: ${err.message}`);
     if (db.isOpen) await client.close();
+    await provider.close();
     process.exit(1);
   }
 }
