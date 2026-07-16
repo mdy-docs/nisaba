@@ -153,6 +153,13 @@ export interface IndexDescription {
 
 // ---- cursors & change streams ---------------------------------------------
 
+/** Which candidate source a filter's query dispatch uses -- consults the
+ * same C planners the queries run. 'scan' is the signal to add an index. */
+export interface ExplainResult {
+  source: 'scan' | 'ids' | 'equality' | 'text' | 'geo';
+  index: string | null;
+}
+
 export interface FindCursor<T extends Document = Document> extends AsyncIterable<T> {
   sort(spec: SortSpec): FindCursor<T>;
   skip(n: number): FindCursor<T>;
@@ -161,9 +168,18 @@ export interface FindCursor<T extends Document = Document> extends AsyncIterable
   toArray(): Promise<T[]>;
   /** Not supported after .sort() -- use toArray()/for-await instead. */
   next(): Promise<{ value: T | undefined; done: boolean }>;
+  /** The plan this cursor's filter gets -- Collection.explain sugar. */
+  explain(): Promise<ExplainResult>;
   /** Required if the cursor is abandoned unexhausted (an open cursor
    * blocks compact(); a GC safety net exists but has no timing
    * guarantee). */
+  close(): Promise<void>;
+}
+
+/** aggregate()'s handle: one execution on first pull. */
+export interface AggregationCursor<T extends Document = Document> extends AsyncIterable<T> {
+  toArray(): Promise<T[]>;
+  next(): Promise<{ value: T | undefined; done: boolean }>;
   close(): Promise<void>;
 }
 
@@ -203,6 +219,12 @@ export class Collection<T extends Document = Document> {
   countDocuments(filter?: Filter): Promise<number>;
   estimatedDocumentCount(): Promise<number>;
   distinct(field: string, filter?: Filter): Promise<any[]>;
+  /** Which source serves `filter` (index or scan) -- see ExplainResult. */
+  explain(filter?: Filter): Promise<ExplainResult>;
+  /** Small aggregation subset: $match (leading stage runs in the engine
+   * with indexes + full grammar), $sort, $skip, $limit, $project, $group
+   * ($sum/$avg/$min/$max/$first/$last/$push/$addToSet/$count), $count. */
+  aggregate<R extends Document = Document>(pipeline?: Document[]): AggregationCursor<R>;
 
   updateOne(filter: Filter, update: Update, options?: { upsert?: boolean }): Promise<UpdateResult>;
   updateMany(filter: Filter, update: Update, options?: { upsert?: boolean }): Promise<UpdateResult>;

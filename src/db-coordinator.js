@@ -79,6 +79,9 @@ async function executeOnRealDb(realDb, collectionName, method, args, coordinator
     const [filter, options] = args;
     return coll.find(filter, options).toArray();
   }
+  if (method === 'aggregate') {
+    return coll.aggregate(args[0]).toArray(); // like find: RPC wants the resolved array, not a cursor
+  }
   return coll[method](...args);
 }
 
@@ -425,6 +428,9 @@ class SharedCollection {
 
       [Symbol.asyncIterator]() { return cursor; },
 
+      /** The plan this cursor's filter gets on the leader -- see Collection.explain. */
+      async explain() { return coord.dispatch(name, 'explain', [filter]); },
+
       /** Safe to call more than once, or on an already-exhausted cursor. */
       async close() { closed = true; },
 
@@ -445,6 +451,29 @@ class SharedCollection {
   async countDocuments(filter = {}) { return this._coord.dispatch(this.name, 'countDocuments', [filter]); }
   async estimatedDocumentCount() { return this._coord.dispatch(this.name, 'estimatedDocumentCount', []); }
   async distinct(field, filter = {}) { return this._coord.dispatch(this.name, 'distinct', [field, filter]); }
+  async explain(filter = {}) { return this._coord.dispatch(this.name, 'explain', [filter]); }
+  /** Same cursor-like shape as the real aggregate(); one RPC on first pull. */
+  aggregate(pipeline = []) {
+    const coord = this._coord, name = this.name;
+    let items = null;
+    let idx = 0;
+    const cursor = {
+      async toArray() {
+        if (items === null) items = await coord.dispatch(name, 'aggregate', [pipeline]);
+        const rest = items.slice(idx);
+        idx = items.length;
+        return rest;
+      },
+      async next() {
+        if (items === null) items = await coord.dispatch(name, 'aggregate', [pipeline]);
+        return idx < items.length ? { value: items[idx++], done: false } : { value: undefined, done: true };
+      },
+      [Symbol.asyncIterator]() { return cursor; },
+      async close() { items = items || []; idx = items.length; },
+      async return() { await cursor.close(); return { value: undefined, done: true }; }
+    };
+    return cursor;
+  }
   async bulkWrite(operations, options = {}) { return this._coord.dispatch(this.name, 'bulkWrite', [operations, options]); }
   async pruneExpired() { return this._coord.dispatch(this.name, 'pruneExpired', []); }
   /** Runs on the leader (the only context holding the files). An operation

@@ -22,6 +22,12 @@ Database commands:
   compact [coll]                         Rewrite a collection's files (all
                                          collections if omitted) without their
                                          append-only history, reclaiming space
+  dump [coll]                            Write the database (or one collection)
+                                         to stdout as Extended-JSON JSONL,
+                                         indexes included
+  restore                                Read a dump from stdin into this
+                                         database (fresh names only: documents
+                                         keep their _ids)
 
 Document commands:
   insert <coll> <doc>                    Insert one document
@@ -145,6 +151,9 @@ function parseJson(label, str) {
         if (keys.length === 1 && keys[0] === '$date' && typeof value.$date === 'string') {
           return new Date(value.$date);
         }
+        if (keys.length === 1 && keys[0] === '$binary' && value.$binary && typeof value.$binary.base64 === 'string') {
+          return new Uint8Array(Buffer.from(value.$binary.base64, 'base64'));
+        }
       }
       return value;
     });
@@ -152,6 +161,34 @@ function parseJson(label, str) {
     console.error(`Error: ${label} is not valid JSON: ${err.message}`);
     process.exit(1);
   }
+}
+
+/** The inverse of parseJson's reviver: ObjectId/Date/Uint8Array to
+ * MongoDB Extended JSON, recursively, for `dump` output -- so a dump
+ * restores byte-identically through parseJson. */
+function toExtendedJson(value) {
+  if (value instanceof ObjectId || (value && typeof value.toHexString === 'function')) {
+    return { $oid: value.toHexString() };
+  }
+  if (value instanceof Date) return { $date: value.toISOString() };
+  if (value instanceof Uint8Array) return { $binary: { base64: Buffer.from(value).toString('base64'), subType: '00' } };
+  if (Array.isArray(value)) return value.map(toExtendedJson);
+  if (value !== null && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = toExtendedJson(v);
+    return out;
+  }
+  return value;
+}
+
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { data += chunk; });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', reject);
+  });
 }
 
 function parseArgs(argv) {
@@ -548,6 +585,67 @@ async function main() {
         const coll = await db.collection(args[0]);
         const deletedCount = await coll.pruneExpired();
         console.log(`Pruned ${deletedCount} expired document(s).`);
+        break;
+      }
+
+      // JSONL to stdout: one {"collection", "indexes"} header line per
+      // collection, then one {"collection", "doc"} line per document,
+      // Extended JSON throughout ({$oid}/{$date}/{$binary}) -- see
+      // bin/db.md "Dump and restore". Streams batch-by-batch, never the
+      // whole collection in memory. Doubles as the escape hatch for any
+      // future on-disk format migration (docs/format-compatibility.md).
+      case 'dump': {
+        const names = args[0] ? [args[0]] : await db.listCollections();
+        for (const name of names) {
+          const coll = await db.collection(name);
+          const indexes = await coll.listIndexes();
+          process.stdout.write(JSON.stringify({ collection: name, indexes: toExtendedJson(indexes) }) + '\n');
+          const cursor = coll.find({});
+          for (;;) {
+            const { value, done } = await cursor.next();
+            if (done) break;
+            process.stdout.write(JSON.stringify({ collection: name, doc: toExtendedJson(value) }) + '\n');
+          }
+        }
+        break;
+      }
+
+      // Reads a dump from stdin. Header lines recreate indexes;
+      // documents keep their _ids, inserted in batches. Restoring into a
+      // database that already holds any of the same _ids fails loudly
+      // (DuplicateKeyError) -- restore into a fresh database name.
+      case 'restore': {
+        const lines = (await readStdin()).split('\n');
+        let batch = [];
+        let batchColl = null;
+        let inserted = 0, collections = 0;
+        const flush = async () => {
+          if (!batch.length) return;
+          const coll = await db.collection(batchColl);
+          await coll.insertMany(batch, { ordered: true });
+          inserted += batch.length;
+          batch = [];
+        };
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const entry = parseJson('restore line', line);
+          if (entry.indexes) {
+            await flush();
+            const coll = await db.collection(entry.collection);
+            collections++;
+            for (const def of entry.indexes) {
+              const { name, key, ...opts } = def;
+              await coll.createIndex(key, { name, ...opts });
+            }
+            continue;
+          }
+          if (entry.collection !== batchColl) await flush();
+          batchColl = entry.collection;
+          batch.push(entry.doc);
+          if (batch.length >= 500) await flush();
+        }
+        await flush();
+        console.log(`Restored ${inserted} document(s) across ${collections} collection(s).`);
         break;
       }
 

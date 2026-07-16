@@ -35,6 +35,8 @@ same format. Point `NISABA_DIR=~/.node-opfs` to keep using them.
 | `collections` | List collection names (default) |
 | `drop-collection <coll>` | Drop a collection and its indexes |
 | `compact [coll]` | Rewrite a collection's files (all collections if omitted) without their append-only history, reclaiming space — see `docs/compaction.md` |
+| `dump [coll]` | Write the database (or one collection) to stdout as Extended-JSON JSONL: one `{"collection", "indexes"}` header line per collection, one `{"collection", "doc"}` line per document |
+| `restore` | Read a dump from stdin into this database. Documents keep their `_id`s and indexes are recreated first, so restore into a **fresh** database name (existing `_id`s fail loudly) |
 | `insert <coll> <doc>` | Insert one document |
 | `insert-many <coll> <docs>` | Insert an array of documents |
 | `find <coll> [filter]` | Find matching documents (`{}` if omitted) |

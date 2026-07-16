@@ -81,7 +81,7 @@ EXPORTS='_malloc,_free,'\
 '_dcw_find_by_index,'\
 '_dcw_insert_one,_dcw_insert_many,_dcw_find_one,_dcw_find,_dcw_delete_one,_dcw_delete_many,'\
 '_dcw_cursor_open,_dcw_cursor_next_batch,_dcw_cursor_close,'\
-'_dcw_replace_one,_dcw_count,_dcw_distinct,'\
+'_dcw_replace_one,_dcw_count,_dcw_distinct,_dcw_explain,'\
 '_dcw_update_one,_dcw_update_many,'\
 '_dcw_find_one_and_update,_dcw_find_one_and_replace,_dcw_find_one_and_delete,'\
 '_dcw_out_new,_dcw_out_free,_dcw_out_ptr,_dcw_out_len'

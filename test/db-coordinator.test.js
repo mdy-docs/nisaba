@@ -121,6 +121,33 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
     await Promise.all(survivors.map((d) => d.close()));
   });
 
+  it('aggregate() and explain() proxy to the leader like any other method', async () => {
+    const provider = new MemoryStorageProvider();
+    const dbName = nextDbName();
+    const [a, b] = await Promise.all([
+      connectShared(dbName, provider, {}),
+      connectShared(dbName, provider, {})
+    ]);
+    const follower = a._coord.role === 'leader' ? b : a;
+
+    const sales = await follower.collection('sales');
+    await sales.createIndex({ region: 1 }, { name: 'regionIdx' });
+    await sales.insertMany([
+      { region: 'eu', qty: 2 }, { region: 'eu', qty: 1 }, { region: 'us', qty: 5 }
+    ]);
+
+    const grouped = await sales.aggregate([
+      { $group: { _id: '$region', units: { $sum: '$qty' } } },
+      { $sort: { _id: 1 } }
+    ]).toArray();
+    expect(grouped).toEqual([{ _id: 'eu', units: 3 }, { _id: 'us', units: 5 }]);
+
+    expect(await sales.explain({ region: 'eu' })).toEqual({ source: 'equality', index: 'regionIdx' });
+    expect(await sales.find({ region: 'eu' }).explain()).toEqual({ source: 'equality', index: 'regionIdx' });
+
+    await Promise.all([a, b].map((d) => d.close()));
+  });
+
   it('a retried request (same requestId) is replayed by the leader, never executed twice', async () => {
     const provider = new MemoryStorageProvider();
     const dbName = nextDbName();

@@ -1,13 +1,11 @@
-# CI (docs/roadmap.md P0 #5): three jobs, deliberately independent --
+# CI (docs/roadmap.md P0 #5). wasm/lib is gitignored (artifacts are built
+# at `npm pack` time via prepack, never committed), so every job starts by
+# building the WASM module from the C sources with a pinned emsdk -- which
+# also means every run verifies sources and JS wrapper agree. Two suites:
 #   node:    the full node suite, including the real OPFS code paths
 #            (node-opfs shims navigator.storage in Node).
 #   browser: the *.browser.test.js suite under Playwright Chromium -- real
 #            Workers, real OPFS sync access handles, real navigator.locks.
-#   wasm:    rebuild wasm/lib from the C sources with a pinned emsdk and
-#            run the node suite against the FRESH artifacts. This checks
-#            the committed artifacts and the sources still agree
-#            functionally; it does not byte-compare (emcc output is not
-#            reproducible enough across hosts to make that a stable gate).
 name: CI
 
 on:
@@ -26,7 +24,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Keep in lockstep with wasm/build-wasm.sh's header comment.
+          version: 5.0.7
       - run: npm ci
+      - run: ./wasm/build-wasm.sh
       - run: npm test
 
   browser:
@@ -39,28 +42,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: npm run test:browser
-
-  wasm:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
       - uses: mymindstorm/setup-emsdk@v14
         with:
-          # Keep in lockstep with the version used for the committed
-          # wasm/lib artifacts (wasm/build-wasm.sh's header comment).
           version: 5.0.7
       - run: npm ci
       - run: ./wasm/build-wasm.sh
-      - name: Node suite against freshly built artifacts
-        run: npm test
-      - name: Show drift against committed artifacts (informational)
-        run: git diff --stat wasm/lib || true
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser

@@ -33,9 +33,11 @@ so scalar `_id`s are a format-v2 migration, now recorded below; scalar
 `_id`s throw `InvalidIdError` pointing at the unique-index alternative.
 #4 shipped with its own dedicated suite (`test/db.nodefs.test.js`)
 rather than parametrizing the OPFS tests — parametrization is still
-worth doing. #5's wasm job verifies by rebuilding and running the suite
-against fresh artifacts instead of byte-diffing (emcc output isn't
-reproducible enough across hosts for a byte gate).
+worth doing. #5: wasm/lib turned out to be gitignored (artifacts build at pack
+time, never committed), so every CI job builds from the C sources with
+a pinned emsdk before testing -- each run inherently verifies sources
+and wrapper agree; no byte-diff gate (emcc output isn't reproducible
+enough across hosts).
 
 Everything an evaluator hits in the first ten minutes, plus the two
 things that make Node a real target. Do these before publicizing
@@ -219,16 +221,26 @@ deliberate error, and a test opening a doctored future-version file.
 
 ## P2 — ecosystem polish (after P0/P1)
 
-- **`aggregate()` subset** — `$match`/`$sort`/`$skip`/`$limit`/
+**Status: landed 2026-07-16** except scalar `_id`/format v2, which stays
+the one open project. Notes: `explain()` is backed by a real C export
+(`dc_explain`) consulting the same planners the queries run — and the
+spike surfaced that `find({_id})` full-scanned while `findOne({_id})`
+point-looked-up, so the `{_id}` fast path now covers the whole shared
+dispatch (`gather_matches`/`dc_cursor_open`). `aggregate()` pushes a
+leading `$match` into the engine and documents its JS-side subset.
+`dump`/`restore` round-trip Extended JSON including index definitions.
+`npm run bench` covers both providers.
+
+- ✅ **`aggregate()` subset** — `$match`/`$sort`/`$skip`/`$limit`/
   `$project`/`$group` (basic accumulators), executable JS-side over
   `find()`; covers most reach-for-it moments without touching C.
-- **`explain()`** — even `{ index: 'team_1' | null, scanned: n }` per
+- ✅ **`explain()`** — even `{ index: 'team_1' | null, scanned: n }` per
   query, so users can tell whether an index was used. The C dispatch
   already knows.
-- **CLI dump/restore** — `db <name> dump > x.jsonl` /
+- ✅ **CLI dump/restore** — `db <name> dump > x.jsonl` /
   `restore < x.jsonl` (extended-JSON for ObjectId/Date). Doubles as the
   escape hatch for any future format migration.
-- **Benchmarks** — a small tracked suite (insert/query/index/compact at
+- ✅ **Benchmarks** — a small tracked suite (insert/query/index/compact at
   1k/100k docs, node + browser) guarding the WASM-boundary cost from
   regressions.
 - **Scalar `_id` support (format v2)** — the P0 #3 spike's finding:
@@ -236,7 +248,7 @@ deliberate error, and a test opening a doctored future-version file.
   index-row back-pointer format, migration per
   `docs/format-compatibility.md`'s rules. A real project; the format
   stamp machinery it needs now exists.
-- **Non-goals to state in the README**: cross-collection transactions,
+- ✅ **Non-goals to state in the README**: cross-collection transactions,
   watch() pipelines/`updateDescription` beyond current scope,
   multi-writer across origins/processes (single-leader by design).
 

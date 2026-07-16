@@ -295,6 +295,17 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             const qry_options *opts, uint8_t **out, size_t *out_len);
 
 /*
+ * Report which candidate source the shared query dispatch would use for
+ * `filter`, without executing anything -- consults the same planners the
+ * queries run, so it cannot drift. *kind_out: 0 full scan, 1 {_id} point
+ * lookup, 2 equality index, 3 text index, 4 geo index. For kinds 2-4 the
+ * serving index's name is written through *name_out / *name_len_out
+ * (malloc'd; caller frees); NULL otherwise.
+ */
+int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+               int *kind_out, uint8_t **name_out, size_t *name_len_out);
+
+/*
  * A resumable, bounded-memory cursor over documents matching `filter`
  * (opened via dc_cursor_open, advanced in batches via
  * dc_cursor_next_batch, released via dc_cursor_close). Unlike dc_find,

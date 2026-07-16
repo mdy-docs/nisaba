@@ -1331,8 +1331,22 @@ static void dc_source_free(dc_source *src) {
  * db_query.c's evaluator will reject $near/$geoWithin as unrecognized
  * operators rather than silently ignoring them).
  */
-static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_t filter_len, dc_source *src) {
-    memset(src, 0, sizeof(*src));
+/*
+ * Detection half of the special-source dispatch, shared by
+ * resolve_special_source (which goes on to execute the query) and
+ * dc_explain (which only reports the choice): scans `filter`'s top level
+ * for the first special operator ($text, or a field whose value is
+ * exactly {$near: ...}/{$geoWithin: ...}) and resolves the index that
+ * would serve it. *found stays 0 when nothing special applies; a special
+ * operator without its required index is BJ_ERR_STATE, exactly the error
+ * executing the query would raise.
+ */
+static int detect_special_source(dc_collection *c, const uint8_t *filter, size_t filter_len,
+                                 int *found, int *is_text,
+                                 const uint8_t **skey_out, uint32_t *skey_len_out,
+                                 const uint8_t **sval_out, size_t *sval_len_out,
+                                 dc_index **ix_out) {
+    *found = 0; *is_text = 0; *ix_out = NULL;
 
     cur fc = { filter, filter_len, 0 };
     uint32_t fcount;
@@ -1341,7 +1355,6 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
 
     const uint8_t *skey = NULL; uint32_t skey_len = 0;
     const uint8_t *sval = NULL; size_t sval_len = 0;
-    int is_text = 0;
 
     for (uint32_t i = 0; i < fcount; i++) {
         const uint8_t *kp; uint32_t klen;
@@ -1353,7 +1366,7 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
         const uint8_t *v = fc.d + vstart; size_t vlen = fc.pos - vstart;
 
         if (klen == 5 && memcmp(kp, "$text", 5) == 0) {
-            skey = kp; skey_len = klen; sval = v; sval_len = vlen; is_text = 1;
+            skey = kp; skey_len = klen; sval = v; sval_len = vlen; *is_text = 1;
             break;
         }
         if (vlen >= 1 && v[0] == BJ_TYPE_OBJECT) {
@@ -1364,7 +1377,7 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
                 if (!take_key(&vc, &okp, &oklen)) {
                     if ((oklen == 5 && memcmp(okp, "$near", 5) == 0) ||
                         (oklen == 10 && memcmp(okp, "$geoWithin", 10) == 0)) {
-                        skey = kp; skey_len = klen; sval = v; sval_len = vlen; is_text = 0;
+                        skey = kp; skey_len = klen; sval = v; sval_len = vlen; *is_text = 0;
                         break;
                     }
                 }
@@ -1372,16 +1385,46 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
         }
     }
 
-    if (!skey) return BJ_OK; /* nothing special; src->use_index stays 0 */
+    if (!skey) return BJ_OK; /* nothing special */
+
+    if (*is_text) {
+        for (uint32_t i = 0; i < c->index_count; i++) {
+            if (c->indexes[i].kind == DC_IDX_TEXT) { *ix_out = &c->indexes[i]; break; }
+        }
+        if (!*ix_out) return BJ_ERR_STATE; /* $text requires a text index */
+    } else {
+        for (uint32_t i = 0; i < c->index_count; i++) {
+            if (c->indexes[i].kind == DC_IDX_GEO &&
+                c->indexes[i].geo_field_len == skey_len &&
+                memcmp(c->indexes[i].geo_field, skey, skey_len) == 0) {
+                *ix_out = &c->indexes[i]; break;
+            }
+        }
+        if (!*ix_out) return BJ_ERR_STATE; /* $near/$geoWithin requires a geo index on this field */
+    }
+
+    *found = 1;
+    *skey_out = skey; *skey_len_out = skey_len;
+    *sval_out = sval; *sval_len_out = sval_len;
+    return BJ_OK;
+}
+
+static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_t filter_len, dc_source *src) {
+    memset(src, 0, sizeof(*src));
+
+    int found = 0, is_text = 0;
+    const uint8_t *skey = NULL; uint32_t skey_len = 0;
+    const uint8_t *sval = NULL; size_t sval_len = 0;
+    dc_index *six = NULL;
+    int e = detect_special_source(c, filter, filter_len, &found, &is_text,
+                                  &skey, &skey_len, &sval, &sval_len, &six);
+    if (e) return e;
+    if (!found) return BJ_OK; /* nothing special; src->use_index stays 0 */
 
     uint8_t *raw = NULL; size_t raw_len = 0; /* entries array, before id resolution */
 
     if (is_text) {
-        dc_index *tix = NULL;
-        for (uint32_t i = 0; i < c->index_count; i++) {
-            if (c->indexes[i].kind == DC_IDX_TEXT) { tix = &c->indexes[i]; break; }
-        }
-        if (!tix) return BJ_ERR_STATE; /* $text requires a text index */
+        dc_index *tix = six;
 
         const uint8_t *sp; size_t slen; int sfound;
         e = obj_get_field(sval, sval_len, (const uint8_t *)"$search", 7, &sp, &slen, &sfound);
@@ -1400,15 +1443,7 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
         free(raw);
         if (e) return e;
     } else {
-        dc_index *ix = NULL;
-        for (uint32_t i = 0; i < c->index_count; i++) {
-            if (c->indexes[i].kind == DC_IDX_GEO &&
-                c->indexes[i].geo_field_len == skey_len &&
-                memcmp(c->indexes[i].geo_field, skey, skey_len) == 0) {
-                ix = &c->indexes[i]; break;
-            }
-        }
-        if (!ix) return BJ_ERR_STATE; /* $near/$geoWithin requires a geo index on this field */
+        dc_index *ix = six;
 
         cur vc = { sval, sval_len, 0 };
         uint32_t vcount;
@@ -1470,12 +1505,75 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
  * document bytes, and this would regress a large unfiltered count from
  * O(1) to O(every match held in memory) for no benefit.
  */
+/*
+ * Report which candidate source the shared dispatch (gather_matches,
+ * dc_cursor_open, dc_find_one) would use for `filter`, without gathering
+ * or executing anything -- the whole point is that this consults the very
+ * same planners the queries run (detect_special_source,
+ * plan_equality_index, filter_is_id_only), so it can never drift from
+ * what actually happens. kinds: 0 full scan, 1 {_id} point lookup,
+ * 2 equality index, 3 text index, 4 geo index. For kinds 2-4 the serving
+ * index's name is dbuf_dup'd into *name_out (caller frees).
+ */
+int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
+               int *kind_out, uint8_t **name_out, size_t *name_len_out) {
+    *kind_out = 0; *name_out = NULL; *name_len_out = 0;
+
+    uint8_t id[12]; int is_id = 0;
+    int e = filter_is_id_only(filter, filter_len, id, &is_id);
+    if (e) return e;
+    if (is_id) { *kind_out = 1; return BJ_OK; }
+
+    int found = 0, is_text = 0;
+    const uint8_t *skey; uint32_t skey_len; const uint8_t *sval; size_t sval_len;
+    dc_index *ix = NULL;
+    e = detect_special_source(c, filter, filter_len, &found, &is_text,
+                              &skey, &skey_len, &sval, &sval_len, &ix);
+    if (e) return e;
+    if (found) {
+        *kind_out = is_text ? 3 : 4;
+        return dbuf_dup((const uint8_t *)ix->name, ix->name_len, name_out, name_len_out);
+    }
+
+    uint8_t *values = NULL; size_t values_len = 0; int planned = 0;
+    e = plan_equality_index(c, filter, filter_len, &ix, &values, &values_len, &planned);
+    if (e) return e;
+    free(values);
+    if (planned) {
+        *kind_out = 2;
+        return dbuf_dup((const uint8_t *)ix->name, ix->name_len, name_out, name_len_out);
+    }
+    return BJ_OK;
+}
+
 static int gather_matches(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                           qry_doc **out_matches, size_t *out_count) {
     *out_matches = NULL; *out_count = 0;
 
+    /* {_id: <oid>} point lookup -- the same fast path dc_find_one takes,
+     * so find()/updateMany/deleteMany/distinct on an exact id no longer
+     * pay a full scan (and dc_explain's kind 1 is the truth for every
+     * caller of this dispatch). The lookup IS the whole filter (a single
+     * {_id: oid} key -- filter_is_id_only's contract), so no re-check. */
+    uint8_t fid[12]; int fis_id = 0;
+    int e = filter_is_id_only(filter, filter_len, fid, &fis_id);
+    if (e) return e;
+    if (fis_id) {
+        bpt_key key; oid_key(fid, &key);
+        int f = 0; const uint8_t *p; size_t n;
+        e = bpt_search(c->primary, &key, &f, &p, &n);
+        if (e) return e;
+        qry_doc *matches = NULL; size_t match_count = 0, match_cap = 0;
+        if (f) {
+            e = push_match(&matches, &match_count, &match_cap, p, n);
+            if (e) { free_matches(matches, match_count); return e; }
+        }
+        *out_matches = matches; *out_count = match_count;
+        return BJ_OK;
+    }
+
     dc_source src;
-    int e = resolve_special_source(c, filter, filter_len, &src);
+    e = resolve_special_source(c, filter, filter_len, &src);
     if (e) { dc_source_free(&src); return e; }
 
     qry_doc *matches = NULL;
@@ -1789,8 +1887,47 @@ int dc_cursor_open(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         dcur->projection_len = projection_len;
     }
 
+    /* {_id: <oid>} point lookup, mirroring gather_matches: a one-entry
+     * (or empty) candidates array in place of any scan. scan_filter keeps
+     * the original filter -- re-checking {_id: oid} against the looked-up
+     * document is a trivially true no-op, and it keeps this mode's
+     * invariants identical to the planned-index mode below. */
+    uint8_t fid[12]; int fis_id = 0;
+    int e = filter_is_id_only(filter, filter_len, fid, &fis_id);
+    if (e) { dc_cursor_close(dcur); return e; }
+    if (fis_id) {
+        bpt_key key; oid_key(fid, &key);
+        int f = 0; const uint8_t *p; size_t n;
+        e = bpt_search(c->primary, &key, &f, &p, &n);
+        if (e) { dc_cursor_close(dcur); return e; }
+        bj_builder *b = bj_builder_new();
+        if (!b) { dc_cursor_close(dcur); return BJ_ERR_OOM; }
+        e = bj_begin_array(b);
+        if (!e && f) e = bj_put_raw(b, p, (uint32_t)n);
+        if (!e) e = bj_end_array(b);
+        if (!e) {
+            size_t bn; const uint8_t *bp = bj_builder_data(b, &bn);
+            if (!bp) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+            else e = dbuf_dup(bp, bn, &dcur->cand, &dcur->cand_len);
+        }
+        bj_builder_free(b);
+        if (e) { dc_cursor_close(dcur); return e; }
+
+        dcur->scan_filter = (uint8_t *)malloc(filter_len ? filter_len : 1);
+        if (!dcur->scan_filter) { dc_cursor_close(dcur); return BJ_ERR_OOM; }
+        memcpy(dcur->scan_filter, filter, filter_len);
+        dcur->scan_filter_len = filter_len;
+
+        dcur->mode = DC_CURSOR_CANDIDATES;
+        dcur->cand_walk = (cur){ dcur->cand, dcur->cand_len, 0 };
+        e = array_begin(&dcur->cand_walk, &dcur->cand_count);
+        if (e) { dc_cursor_close(dcur); return e; }
+        *out_cursor = dcur;
+        return BJ_OK;
+    }
+
     dc_source src;
-    int e = resolve_special_source(c, filter, filter_len, &src);
+    e = resolve_special_source(c, filter, filter_len, &src);
     if (e) { dc_source_free(&src); dc_cursor_close(dcur); return e; }
 
     if (src.use_index) {

@@ -102,6 +102,25 @@ OIDs). Keep natural keys in their own field with a unique index:
 | `nisaba/coordinator` | `connectShared` — multi-tab sharing via leader election (Worker-side) |
 | `nisaba/wasm` | everything, including the low-level tree/index classes |
 
+### Non-goals
+
+Deliberate scope limits, stated up front rather than discovered late:
+
+- **Cross-collection transactions.** Every single write (including
+  `updateMany`/`bulkWrite` sub-operations) is atomic and journaled;
+  there is no multi-collection transaction and none planned.
+- **Scalar `_id`s** — until a future format v2 (`docs/roadmap.md`): the
+  on-disk format keys everything by fixed 12-byte ObjectIds.
+- **Change-stream pipelines, `updateDescription`, resume tokens.**
+  `watch()` delivers whole events, bounded-buffered; an overflowed
+  consumer re-watches and re-reads current state.
+- **Multi-writer across processes/origins.** One opener per database
+  directory (enforced by OPFS handle exclusivity in browsers and the
+  advisory lock in Node); multi-tab sharing is single-leader by design.
+- **Full aggregation framework.** `aggregate()` is a documented small
+  subset (`docs/db-api.md`); `$lookup`/`$unwind`/expression operators
+  are out of scope.
+
 ## Documentation
 
 - [`docs/db-api.md`](docs/db-api.md) — complete JS-facing API reference.

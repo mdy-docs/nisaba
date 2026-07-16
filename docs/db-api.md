@@ -24,6 +24,8 @@ everywhere else in this package — no BSON, no JSON, no lossy conversion.
   - [Find-and-modify](#find-and-modify)
   - [Delete](#delete)
   - [Counting and distinct values](#counting-and-distinct-values)
+  - [Aggregation (`aggregate`)](#aggregation-aggregate)
+  - [Query plans (`explain`)](#query-plans-explain)
   - [`bulkWrite`](#bulkwrite)
   - [Indexes](#indexes)
   - [Change streams (`watch`)](#change-streams-watch)
@@ -202,6 +204,70 @@ Both return `{ acknowledged: true, deletedCount }`.
 ### Counting and distinct values
 
 Covered above under [Read](#read): `countDocuments`, `estimatedDocumentCount`, `distinct`.
+
+### Aggregation (`aggregate`)
+
+A deliberately small pipeline subset, executed in JS over materialized
+`find()` results — enough for the "group and summarize" reach-for-it
+moments without duplicating the C query engine:
+
+```js
+const perTeam = await users.aggregate([
+  { $match: { active: true } },              // leading $match: runs in the ENGINE
+  { $group: { _id: '$team', n: { $count: {} }, avgAge: { $avg: '$age' } } },
+  { $match: { n: { $gte: 3 } } },            // later $match: JS subset (see below)
+  { $sort: { n: -1 } },
+  { $limit: 10 }
+]).toArray();
+```
+
+- **Stages**: `$match`, `$sort`, `$skip`, `$limit`, `$project`, `$group`,
+  `$count`. Anything else (`$unwind`, `$lookup`, …) throws, naming the
+  stage.
+- **The leading `$match` is pushed down into `find()`** — full engine
+  operator grammar (`$regex`, `$text`, `$near`, …) and index planning
+  apply there. Later `$match` stages run over synthesized documents in
+  JS and accept a documented subset: field conditions, `$eq`/`$ne`/
+  `$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`/`$exists`, `$and`/`$or` — an
+  unsupported operator throws rather than silently not-matching.
+- **`$group`**: `_id` of `null`, `'$path'`, or a composite object;
+  accumulators `$sum` (field or literal), `$avg`, `$min`, `$max`,
+  `$first`, `$last`, `$push`, `$addToSet`, `$count`.
+- **`$project`**: `1`/`0` inclusion XOR exclusion (same rules as
+  `find()`'s projection) plus `'$path'` computed copies.
+- Returns a cursor-like handle (`toArray()`, `next()`, `for await`,
+  `close()`), executing once on first pull. Everything after the
+  pushed-down `$match` is materialized in memory — this is a convenience
+  layer, not a streaming engine.
+- Works through `connectShared` (the leader executes the whole
+  pipeline; one RPC).
+
+### Query plans (`explain`)
+
+```js
+await users.explain({ team: 'core' });
+// => { source: 'equality', index: 'teamIdx' }
+await users.find({ age: { $gt: 30 } }).explain();
+// => { source: 'scan', index: null }   <- the signal to add an index
+```
+
+Reports which candidate source the query dispatch would use for a
+filter, **without executing it** — the WASM side (`dc_explain`) consults
+the very planners the queries run, so the report cannot drift from
+reality. `source` is one of:
+
+| source | meaning |
+|---|---|
+| `'ids'` | `{_id: <ObjectId>}` point lookup on the primary tree |
+| `'equality'` | equality index lookup (`index` names it) |
+| `'text'` | `$text` via the text index |
+| `'geo'` | `$near`/`$geoWithin` via the R-tree |
+| `'scan'` | full collection scan |
+
+The same plan serves `find()` (streaming and sorted), `findOne`,
+`countDocuments`, `updateMany`/`deleteMany` and `distinct`. Note the
+equality planner is deliberately conservative: any `$`-operator
+condition (even on an indexed field) falls back to a scan today.
 
 ### `bulkWrite`
 
