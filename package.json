@@ -1,5 +1,5 @@
 {
-  "name": "nisaba",
+  "name": "@mdy-docs/nisaba-db",
   "version": "1.0.0",
   "description": "A WASM/C, MongoDB-driver-shaped embedded document database (CRUD, query operators, $regex, secondary/geo/text indexes, change streams), built on binjson and binjson-structures",
   "type": "module",
@@ -42,8 +42,19 @@
     "opfs",
     "binjson"
   ],
-  "author": "",
+  "author": "Daniel Walton",
   "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/nisaba-db.git"
+  },
+  "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
+  "bugs": {
+    "url": "https://github.com/mdy-docs/nisaba-db/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@vitest/browser": "^3.2.4",
     "node-opfs": "^1.2.0",

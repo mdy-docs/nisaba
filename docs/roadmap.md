@@ -18,8 +18,8 @@ What's already strong (don't relitigate): the crash-atomicity story and
 its synthesized-crash-window test technique; leader election via
 `navigator.locks` instead of SharedWorker (iOS Safari has none); the
 single execution path for local and proxied calls (`executeOnRealDb`);
-the entry-point split (`nisaba` full / `nisaba/remote` ~11 KB main-thread
-/ `nisaba/coordinator` worker-side); the docs themselves.
+the entry-point split (`nisaba` full / `@mdy-docs/nisaba-db/remote` ~11 KB main-thread
+/ `@mdy-docs/nisaba-db/coordinator` worker-side); the docs themselves.
 
 ---
 
@@ -104,7 +104,7 @@ node-opfs"), and it roots data at `~/.node-opfs/` — a location users
 don't choose.
 
 - Implement `NodeFSStorageProvider(rootDir)` in its own entry
-  (`nisaba/node`, so browser bundles never see `node:fs`): the provider
+  (`@mdy-docs/nisaba-db/node`, so browser bundles never see `node:fs`): the provider
   interface is tiny — `openFile` returning the sync-access-handle shape
   (`read`/`write` at offsets, `getSize`, `truncate`, `flush`, `close`),
   `deleteFile`, `listFiles`, `subProvider` (subdirectory).
@@ -140,8 +140,8 @@ else on this list is trustworthy without this.
 ### 6. README/doc import hygiene ✅
 
 README's usage block imports `./wasm/nisaba-wasm.js`; docs mix relative
-paths. Teach the curated entries: `nisaba`, `nisaba/remote`,
-`nisaba/coordinator` (and `nisaba/node` once #4 lands). Also correct
+paths. Teach the curated entries: `@mdy-docs/nisaba-db`, `@mdy-docs/nisaba-db/remote`,
+`@mdy-docs/nisaba-db/coordinator` (and `@mdy-docs/nisaba-db/node` once #4 lands). Also correct
 the `ready()` ceremony: `connect()` transitively awaits it
 (`BPlusTree.open`), verified empirically — only bare `encode`/`decode`
 before any open need it.
@@ -262,7 +262,7 @@ Roughly dependency-ordered; items within a group are parallelizable.
 2. **#2 errors + #6 docs** — small, immediate, unblock nothing but
    improve everything.
 3. **#4 Node provider** then **#1 types** (types can then include
-   `nisaba/node`).
+   `@mdy-docs/nisaba-db/node`).
 4. **#3 scalar `_id`** — the one P0 with real design risk; spike the
    key-encoding question early in case it demotes to "document the
    restriction."

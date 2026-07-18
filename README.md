@@ -55,7 +55,7 @@ git submodule update --init
 ## Usage
 
 ```js
-import { connect, MemoryStorageProvider } from 'nisaba';
+import { connect, MemoryStorageProvider } from '@mdy-docs/nisaba-db';
 
 const db = await connect(new MemoryStorageProvider());
 const users = await db.collection('users');
@@ -69,7 +69,7 @@ In Node, persist to real files (fsync-backed, per-directory advisory
 lock — no OPFS shim needed):
 
 ```js
-import { connect, NodeFSStorageProvider } from 'nisaba/node';
+import { connect, NodeFSStorageProvider } from '@mdy-docs/nisaba-db/node';
 
 const db = await connect(new NodeFSStorageProvider('./data'));
 ```
@@ -83,7 +83,7 @@ named databases, each its own isolated storage scope — see
 
 No `ready()` call is needed before `connect()` — it awaits the WASM
 instantiation itself; only the WASM-backed low-level surface
-(`nisaba/wasm`'s `encode`/`decode`, tree classes) needs an explicit
+(`@mdy-docs/nisaba-db/wasm`'s `encode`/`decode`, tree classes) needs an explicit
 `await ready()` first.
 
 One deliberate MongoDB deviation to know up front: **`_id` must be an
@@ -96,11 +96,11 @@ OIDs). Keep natural keys in their own field with a unique index:
 
 | import | contents |
 |---|---|
-| `nisaba` | the full in-process database (browser Worker, or anywhere) |
-| `nisaba/node` | ↑ plus `NodeFSStorageProvider` (imports `node:fs` — Node only) |
-| `nisaba/remote` | WASM-free main-thread half: pure-JS codec + `createRemoteBridge` (~27 KB module graph) |
-| `nisaba/coordinator` | `connectShared` — multi-tab sharing via leader election (Worker-side) |
-| `nisaba/wasm` | everything, including the low-level tree/index classes |
+| `@mdy-docs/nisaba-db` | the full in-process database (browser Worker, or anywhere) |
+| `@mdy-docs/nisaba-db/node` | ↑ plus `NodeFSStorageProvider` (imports `node:fs` — Node only) |
+| `@mdy-docs/nisaba-db/remote` | WASM-free main-thread half: pure-JS codec + `createRemoteBridge` (~27 KB module graph) |
+| `@mdy-docs/nisaba-db/coordinator` | `connectShared` — multi-tab sharing via leader election (Worker-side) |
+| `@mdy-docs/nisaba-db/wasm` | everything, including the low-level tree/index classes |
 
 ### Non-goals
 

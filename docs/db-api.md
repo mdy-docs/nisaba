@@ -38,8 +38,8 @@ everywhere else in this package — no BSON, no JSON, no lossy conversion.
 ## Connecting
 
 ```js
-import { connect, MemoryStorageProvider, OPFSStorageProvider } from 'nisaba';
-// (from Node, `import { connect, NodeFSStorageProvider } from 'nisaba/node'`)
+import { connect, MemoryStorageProvider, OPFSStorageProvider } from '@mdy-docs/nisaba-db';
+// (from Node, `import { connect, NodeFSStorageProvider } from '@mdy-docs/nisaba-db/node'`)
 
 // In-memory (tests, ephemeral use — data lives only for the process lifetime)
 const db = await connect(new MemoryStorageProvider());
@@ -71,7 +71,7 @@ databases; here, `provider` already picks the root you want named
 databases under.
 
 ```js
-import { connectClient, OPFSStorageProvider, MemoryStorageProvider } from 'nisaba';
+import { connectClient, OPFSStorageProvider, MemoryStorageProvider } from '@mdy-docs/nisaba-db';
 
 const client = await connectClient(new OPFSStorageProvider(dir));
 const app = await client.db('app');             // real OPFS subdirectory: dir/app/
@@ -514,8 +514,8 @@ collection's files open at once. `src/db-coordinator.js`'s
 
 ```js
 // Inside a dedicated Worker (required — see below)
-import { connectShared } from 'nisaba/coordinator';
-import { OPFSStorageProvider } from 'nisaba';
+import { connectShared } from '@mdy-docs/nisaba-db/coordinator';
+import { OPFSStorageProvider } from '@mdy-docs/nisaba-db';
 
 const dir = await navigator.storage.getDirectory();
 const db = await connectShared('my-app', new OPFSStorageProvider(dir));
